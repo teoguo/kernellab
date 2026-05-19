@@ -1,0 +1,23 @@
+# OS
+.DS_Store
+
+# Editor / IDE / tooling state
+.vscode/
+.idea/
+.cache/
+.claude/
+
+# Worktrees and local scratch
+.worktrees/
+worktrees/
+scratch-*.md
+workstation-*.md
+local-notes/
+
+# Build artifacts
+build/
+build-*/
+
+# Benchmark output and result snapshots
+results/
+results-*/

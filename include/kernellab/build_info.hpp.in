@@ -1,0 +1,9 @@
+#pragma once
+
+namespace kernellab {
+
+inline constexpr const char* kBuildVersion = "@PROJECT_VERSION@";
+inline constexpr const char* kBuildType = "@CMAKE_BUILD_TYPE@";
+inline constexpr const char* kGitSha = "unknown";
+
+}  // namespace kernellab

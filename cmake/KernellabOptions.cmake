@@ -1,0 +1,6 @@
+option(KERNELLAB_ENABLE_CUDA "Enable CUDA backends when available" ON)
+option(KERNELLAB_ENABLE_OPENMP "Enable OpenMP backends when available" ON)
+option(KERNELLAB_BUILD_TESTS "Build kernellab tests" ON)
+option(KERNELLAB_ENABLE_WARNINGS "Enable strict compiler warnings" ON)
+option(KERNELLAB_ENABLE_SANITIZERS "Enable ASan/UBSan in supported CPU builds" OFF)
+set(KERNELLAB_CUDA_ARCHITECTURES "native" CACHE STRING "CUDA architectures for kernellab")
