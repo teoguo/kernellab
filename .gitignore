@@ -29,5 +29,8 @@ results-*/
 
 # Nsight Systems traces can be large; commit exported stats/screenshots instead.
 traces/
+!traces/
+!traces/trace_qwen.nsys-rep
 *.nsys-rep
+!traces/trace_qwen.nsys-rep
 *.qdrep

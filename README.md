@@ -195,9 +195,10 @@ nsys profile \
 ```
 
 See [LLM GEMM Atlas](docs/atlas.md) and [atlas/README.md](atlas/README.md) for
-the full workflow. The expected top-level finding is a measurable prefill vs
-decode efficiency gap: prefill exposes fat GEMMs to cuBLAS, while decode repeats
-memory-bound `M=1` GEMMs that leave most peak FLOPS unused.
+the full workflow. On RTX 6000 Ada, the committed fp16 run measured prefill
+GEMMs at **84.3% peak** versus decode GEMMs at **0.9% peak** (**89.9x** gap).
+Nsight Systems then showed the largest decode GEMV/GEMM kernels accounting for
+about **70.2%** of GPU kernel time in a 128-token `Qwen/Qwen2.5-1.5B` run.
 
 ## Docs
 
