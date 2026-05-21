@@ -169,8 +169,39 @@ Optional exports:
 - `run` and `compare` default to `10` timed iterations and `2` warmups.
 - Reports now distinguish `kernel_ms` from end-to-end `mean_ms`.
 
+## LLM GEMM Atlas
+
+`atlas/` extends kernellab from square GEMM kernels to transformer-shaped GEMMs
+and end-to-end LLM inference profiling. It measures cuBLAS efficiency for
+prefill and decode projection shapes, then maps those microbench results to
+Nsight Systems kernel summaries from a real `Qwen/Qwen2.5-1.5B` inference run.
+
+Start here:
+
+```bash
+python -m pip install -r atlas/requirements.txt
+
+python atlas/bench_transformer_gemm.py \
+  --hardware RTX6000Ada \
+  --out results/transformer_gemm_atlas.csv
+
+nsys profile \
+  -o traces/trace_qwen \
+  --capture-range=cudaProfilerApi \
+  --cuda-memory-usage=true \
+  python atlas/infer_with_profile.py \
+    --model Qwen/Qwen2.5-1.5B \
+    --max-new-tokens 128
+```
+
+See [LLM GEMM Atlas](docs/atlas.md) and [atlas/README.md](atlas/README.md) for
+the full workflow. The expected top-level finding is a measurable prefill vs
+decode efficiency gap: prefill exposes fat GEMMs to cuBLAS, while decode repeats
+memory-bound `M=1` GEMMs that leave most peak FLOPS unused.
+
 ## Docs
 
+- [LLM GEMM Atlas](docs/atlas.md)
 - [Methodology](docs/methodology.md)
 - [Adding a Backend](docs/adding-a-backend.md)
 
