@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""
-Day 3: Plot the GEMM efficiency atlas from the Day-1 CSV.
+"""Plot the GEMM efficiency atlas from the microbench CSV.
 
 Usage:
     python plot_atlas.py --csv results/transformer_gemm_atlas.csv --outdir docs/img
 
 Produces:
-    docs/img/atlas_pct_peak_by_phase.png   -- % of peak, prefill vs decode, per dtype
-    docs/img/atlas_gflops_by_shape.png     -- raw GFLOPS per shape (fp16)
+    docs/img/atlas_pct_peak_by_phase.png   percent of peak, prefill vs decode, per dtype
+    docs/img/atlas_gflops_by_shape.png     GFLOPS per shape (fp16)
 """
 
 import argparse

@@ -40,7 +40,7 @@ python atlas/bench_transformer_gemm.py \
 The script prints a headline such as:
 
 ```text
-HEADLINE (fp16): prefill avg 38.0% peak vs decode avg 1.2% peak (31.7x gap)
+HEADLINE (fp16): prefill avg 84.3% peak vs decode avg 0.9% peak (89.9x gap)
 ```
 
 ## 2. End-to-End Inference Profile
