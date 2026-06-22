@@ -15,23 +15,29 @@ std::string FormatCudaError(const char* operation, const cudaError_t status) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
 }
 
-// cuda_reg_v2 Layer 3: cuda_reg's 128x128 register-tiled GEMM plus
+// cuda_reg_v2 Layer 4: cuda_reg's 128x128 register-tiled GEMM plus
 // float4 vectorized movement, double-buffered smem, and cp.async
-// global-to-smem copies on the hot tile load path.
+// global-to-smem copies, with an explicit block -> warp -> thread tile
+// mapping.
 //
 // We intentionally keep the same BM/BN/BK/TM/TN shape as cuda_reg so the
-// layer isolates one idea: replace ordinary global loads with the
-// sm_80+ async copy pipeline.  Correctness still wins over speed: edge
-// tiles use cp.async's zero-fill source-size operand instead of reading
-// outside A/B.
+// layer isolates one idea beyond Layer 3: instead of each warp spanning
+// a skinny 16x128 strip, eight warps cover a 2x4 grid of 64x32 warp
+// tiles.  Correctness still wins over speed: edge tiles use cp.async's
+// zero-fill/fallback path instead of reading outside A/B.
 constexpr int kBlockM = 128;
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 8;
 constexpr int kThreadM = 8;
 constexpr int kThreadN = 8;
 constexpr int kThreadsPerBlock = 256;
-constexpr int kThreadTilesN = kBlockN / kThreadN;
 constexpr int kFloat4Width = 4;
+constexpr int kWarpSize = 32;
+constexpr int kWarpTilesM = 2;
+constexpr int kWarpTilesN = 4;
+constexpr int kWarpTileM = kBlockM / kWarpTilesM;
+constexpr int kWarpTileN = kBlockN / kWarpTilesN;
+constexpr int kWarpLaneTilesN = kWarpTileN / kThreadN;
 
 // Layer 3 changes A's smem layout from transposed As[bk][row] to
 // row-major As[row][bk].  That is the key cp.async enabler: one A row
@@ -41,13 +47,16 @@ constexpr int kFloat4Width = 4;
 // A plain stride of BK+1=9 would reduce bank conflicts, but row starts
 // would not all be 16-byte aligned, which is unsafe for 16-byte cp.async.
 // A stride of 12 floats keeps every row start 16-byte aligned.  The
-// extra 4-float group skew makes rows 8 apart land on different banks;
-// one warp currently covers two 8-row groups, so this avoids a steady
-// two-address/same-bank pattern when loading a_frag.
+// Layer 4's warp tile covers eight 8-row groups.  The row-group skew is
+// monotonic across the 16 row groups in a block, not periodic, because a
+// periodic reset would make later padded rows overlap earlier storage.
+// Rows 8 apart still land on different banks for the same bk, which
+// reduces the bank-pressure risk created by row-major A reads.
 constexpr int kAsStride = kBlockK + 4;
 constexpr int kAsGroupRows = kThreadM;
 constexpr int kAsGroupSkew = 4;
-constexpr int kAsSmemElements = (kBlockM * kAsStride) + kAsGroupSkew;
+constexpr int kAsGroups = kBlockM / kAsGroupRows;
+constexpr int kAsSmemElements = (kBlockM * kAsStride) + ((kAsGroups - 1) * kAsGroupSkew);
 
 __device__ bool IsAligned16(const float* pointer) {
   return (reinterpret_cast<std::uintptr_t>(pointer) % alignof(float4)) == 0;
@@ -119,7 +128,7 @@ __device__ void CpAsyncWaitAll() {
 }
 
 __device__ int AsOffset(const int row, const int bk) {
-  const int group_skew = ((row / kAsGroupRows) & 1) * kAsGroupSkew;
+  const int group_skew = (row / kAsGroupRows) * kAsGroupSkew;
   return (row * kAsStride) + group_skew + bk;
 }
 
@@ -202,13 +211,12 @@ __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
     }
 }
 
-__global__ void RegV2CpAsyncKernel(const float* __restrict__ a,
-                                   const float* __restrict__ b, float* __restrict__ c, int m,
-                                   int n, int k) {
-  // Layer 3 still owns two copies of each smem tile, but global-to-smem
-  // movement now uses cp.async.  A is flat because each row has an
-  // explicit padded/skewed offset rather than a simple rectangular C
-  // array layout.
+__global__ void RegV2WarpTiledKernel(const float* __restrict__ a,
+                                     const float* __restrict__ b, float* __restrict__ c, int m,
+                                     int n, int k) {
+  // Layer 4 still owns two copies of each smem tile and still uses
+  // cp.async.  The new part is the work mapping below: eight warps form
+  // a 2x4 grid of 64x32 warp tiles inside the 128x128 block tile.
   __shared__ __align__(16) float as[2][kAsSmemElements];
   __shared__ __align__(16) float bs[2][kBlockK][kBlockN];
 
@@ -216,11 +224,25 @@ __global__ void RegV2CpAsyncKernel(const float* __restrict__ a,
   const int block_row = blockIdx.y * kBlockM;
   const int block_col = blockIdx.x * kBlockN;
 
-  // Map the 1D thread id to a 16x16 grid of 8x8 micro-tiles.
-  const int thread_tile_row = tid / kThreadTilesN;
-  const int thread_tile_col = tid % kThreadTilesN;
-  const int row_base = thread_tile_row * kThreadM;
-  const int col_base = thread_tile_col * kThreadN;
+  // Warp tiling: one block tile is split into 2x4 warp tiles.  Inside a
+  // warp, lanes are arranged as 8 row groups by 4 column groups, and
+  // each lane still computes one 8x8 register tile.  This creates an
+  // explicit block -> warp -> thread hierarchy:
+  //
+  //   block tile: 128x128
+  //   warp tile :  64x32
+  //   lane tile :   8x8
+  //
+  // The mapping is arithmetic only; no synchronization is needed within
+  // the warp because every lane owns disjoint C elements.
+  const int warp_id = tid / kWarpSize;
+  const int lane_id = tid % kWarpSize;
+  const int warp_tile_row = warp_id / kWarpTilesN;
+  const int warp_tile_col = warp_id % kWarpTilesN;
+  const int lane_tile_row = lane_id / kWarpLaneTilesN;
+  const int lane_tile_col = lane_id % kWarpLaneTilesN;
+  const int row_base = (warp_tile_row * kWarpTileM) + (lane_tile_row * kThreadM);
+  const int col_base = (warp_tile_col * kWarpTileN) + (lane_tile_col * kThreadN);
 
   float acc[kThreadM][kThreadN];
 #pragma unroll
@@ -357,8 +379,8 @@ private:
       const dim3 block(kThreadsPerBlock);
       const dim3 grid(static_cast<unsigned int>((c.cols() + kBlockN - 1) / kBlockN),
                       static_cast<unsigned int>((c.rows() + kBlockM - 1) / kBlockM));
-      RegV2CpAsyncKernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_, n_,
-                                                      k_);
+      RegV2WarpTiledKernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_, n_,
+                                                        k_);
 
       const cudaError_t launch_status = cudaGetLastError();
       if (launch_status != cudaSuccess) {

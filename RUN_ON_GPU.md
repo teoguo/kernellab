@@ -1,6 +1,6 @@
 # RUN_ON_GPU.md
 
-在远程 Linux + RTX 6000 Ada 机器上执行以下命令。假设你已经在 `kernellab-atlas-work` repo 根目录，并且分支是 `feat/cuda-reg-tiling`。
+在远程 Linux + RTX 6000 Ada 机器上执行以下命令。假设你已经在 `kernellab-atlas-work` repo 根目录，并且分支是 `feat/cuda-reg-v2`。
 
 ## 0. 确认环境
 
@@ -73,7 +73,16 @@ CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
 ./build-cuda/kernellab compare --backends cuda_naive,cuda_smem,cuda_reg,cublas --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 10
 ```
 
-For `cuda_reg_v2` layer work, compare the stable baseline, current v2 layer, and cuBLAS:
+For `cuda_reg_v2` layer work, compare the stable baseline, current v2 layer, and cuBLAS. To reproduce a specific layer, check out its commit first:
+
+```bash
+git checkout 9f41573   # Layer 1: float4
+git checkout 30936c6   # Layer 2: ordinary-load double buffering
+git checkout 0fd625b   # Layer 3: cp.async
+git checkout feat/cuda-reg-v2  # Layer 4: warptiling branch tip
+```
+
+Then build, verify, and benchmark the checked-out layer:
 
 ```bash
 ./build-cuda/kernellab verify --backend cuda_reg_v2 --m 128 --n 128 --k 128
@@ -94,7 +103,7 @@ mkdir -p results
 ./build-cuda/kernellab compare --backends cuda_naive,cuda_smem,cuda_reg,cublas --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 10 --csv-out results/cuda_reg_4096.csv
 ```
 
-## 4. NCU: cuda_reg @4096^3
+## 4. NCU: cuda_reg / cuda_reg_v2 @4096^3
 
 先跑 section-based profile，通常最稳：
 
@@ -152,6 +161,35 @@ cmake -S . -B build-cuda-ptxas \
   -DCMAKE_CUDA_FLAGS="--ptxas-options=-v"
 cmake --build build-cuda-ptxas --target kernellab_core --clean-first 2>&1 | tee results/ptxas_cuda_reg_build.log
 grep -A4 -B2 RegTiledKernel results/ptxas_cuda_reg_build.log
+```
+
+For `cuda_reg_v2`, use the current layer's kernel name. Layer 3 uses
+`RegV2CpAsyncKernel`; Layer 4 uses `RegV2WarpTiledKernel`:
+
+```bash
+# Layer 3 cp.async
+/usr/local/cuda-12.1/bin/ncu \
+  --target-processes all \
+  --kernel-name regex:RegV2CpAsyncKernel \
+  --launch-skip 3 \
+  --launch-count 1 \
+  --metrics launch__registers_per_thread,sm__warps_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
+  ./build-cuda/kernellab run --backend cuda_reg_v2 --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 1
+
+# Layer 4 warptiling
+/usr/local/cuda-12.1/bin/ncu \
+  --target-processes all \
+  --kernel-name regex:RegV2WarpTiledKernel \
+  --launch-skip 3 \
+  --launch-count 1 \
+  --metrics launch__registers_per_thread,sm__warps_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
+  ./build-cuda/kernellab run --backend cuda_reg_v2 --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 1
+```
+
+For `ptxas` on v2, the same build log works; grep the current layer:
+
+```bash
+grep -A4 -B2 "RegV2CpAsyncKernel\\|RegV2WarpTiledKernel" results/ptxas_cuda_reg_build.log
 ```
 
 ## 5. 如果看到 spill

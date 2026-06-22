@@ -218,3 +218,83 @@ There is no spill, but register pressure jumped from Layer 2's 109 registers/thr
 - Why `commit_group` and `wait_group 0`? `commit_group` publishes the issued async copies as a group; `wait_group 0` waits until no committed group is pending before the tile is consumed.
 - Why still use `__syncthreads()` after wait? `wait_group` is per-thread. The tile is cooperatively loaded, so the block needs a barrier before every thread can safely read every other thread's copied data.
 - Why did 4096^3 regress? The row-major A layout increased compute-side shared-memory loads and pushed register use to 129/thread, reducing theoretical occupancy to one block/SM.
+
+## Layer 4: explicit warp tiling
+
+### What changed
+
+Layer 4 keeps Layer 3's cp.async copy path and row-major A staging, but changes how the 256 threads are assigned to the 128x128 block tile.
+
+Layer 3 effectively mapped each warp to a skinny `16x128` strip: two 8-row groups and all sixteen 8-column groups. Layer 4 makes the hierarchy explicit:
+
+```text
+block tile: 128x128
+warp grid : 2 x 4 warps
+warp tile : 64x32
+lane grid : 8 x 4 lanes per warp
+lane tile : 8x8
+```
+
+So the 8 warps in the CTA cover the block tile as:
+
+```text
+warp 0: rows   0..63, cols   0..31
+warp 1: rows   0..63, cols  32..63
+warp 2: rows   0..63, cols  64..95
+warp 3: rows   0..63, cols  96..127
+warp 4: rows  64..127, cols   0..31
+warp 5: rows  64..127, cols  32..63
+warp 6: rows  64..127, cols  64..95
+warp 7: rows  64..127, cols  96..127
+```
+
+Each lane still computes one `8x8` register tile, so the fp32 math and store guards do not change. The A shared-memory skew also changes from a two-group pattern to a monotonic 16-group skew. That avoids overlap in the padded A buffer and spreads the eight row groups inside a warp tile across different bank starts.
+
+### Why it helps
+
+Warp tiling adds an explicit level between the block tile and the thread tile. The goal is to make each warp work on a more balanced 2D sub-tile instead of a long horizontal strip. Compared with Layer 3, a warp now has more M-side locality and less N-side span. That can improve scheduling and shared-memory access balance because B reuse and A reuse are less lopsided inside a warp.
+
+This is still much simpler than CUTLASS/cuBLAS. It does not add warp-level MMA instructions, Tensor Cores, hand-scheduled SASS, or an autotuned tile search. It is a readable educational warp tile, not a production GEMM generator.
+
+### Expected vs measured
+
+Expected from the design doc: +3-5% over the cp.async layer if the warp-level reuse pattern improves ILP and shared-memory behavior.
+
+Measured results:
+
+| Size | cuda_reg_v2 Layer 4 GFLOPs | % cuBLAS | Verification |
+| ---: | -------------------------: | -------: | :----------: |
+| 1024^3 | 16251.5 | 48.9% | passed |
+| 2048^3 | 34071.0 | 66.9% | passed |
+| 4096^3 | 35646.9 | 76.1% | passed |
+
+Same-run comparison against `cuda_reg`:
+
+| Size | cuda_reg GFLOPs | cuda_reg_v2 L4 GFLOPs | Uplift |
+| ---: | --------------: | --------------------: | -----: |
+| 1024^3 | 11983.1 | 16251.5 | +35.6% |
+| 2048^3 | 33113.8 | 34071.0 | +2.9% |
+| 4096^3 | 33244.7 | 35646.9 | +7.2% |
+
+Layer 4 improves over Layer 3 at every measured size, including 4096^3: 35646.9 GFLOPs vs 34726.2 GFLOPs. It still does not beat Layer 2 at the target size: Layer 2 measured 36056.5 GFLOPs. The honest conclusion is that the warp mapping helped, but not enough to repay the row-major A staging and high register pressure introduced for cp.async.
+
+### ptxas / NCU
+
+NCU remains blocked by `ERR_NVGPUCTRPERM`.
+
+`ptxas --verbose` output:
+
+```text
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 130 registers, 20960 bytes smem, 388 bytes cmem[0]
+```
+
+There is still no spill, but the kernel remains register-limited to one 256-thread block per SM: `2 * 256 * 130 = 66560` registers would exceed a 65536-register file. That occupancy limit is the clearest ptxas-visible reason this educational path stalls in the mid-70% cuBLAS range instead of moving toward 90%.
+
+### Defense checklist
+
+- What is warp tiling? It splits the block tile into warp-owned sub-tiles, then splits each warp tile into lane-owned register tiles.
+- Why `64x32` per warp? `2 x 4` warp tiles exactly cover `128x128`, and each `64x32` warp tile contains 32 lanes times one `8x8` lane tile.
+- What changed versus Layer 3? Only work assignment and A-bank skew. The copy pipeline, fp32 arithmetic, and oracle/timing contract stay the same.
+- Did it reach 90%? No. It recovered part of the cp.async regression, but 4096^3 reached 76.1% cuBLAS, below Layer 2's 77.0%.
+- Why not keep pushing blindly? The next wins likely require deeper layout redesign, register-pressure reduction, autotuning, or assembly-level scheduling. Those are beyond this readable four-layer educational pass.
