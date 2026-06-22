@@ -192,7 +192,70 @@ For `ptxas` on v2, the same build log works; grep the current layer:
 grep -A4 -B2 "RegV2CpAsyncKernel\\|RegV2WarpTiledKernel" results/ptxas_cuda_reg_build.log
 ```
 
-## 5. 如果看到 spill
+## 5. cuda_reg_v2 autotune sweep / champion
+
+The current `feat/cuda-reg-autotune` default is the champion config:
+
+```text
+BM=128, BN=128, BK=16, TM=8, TN=8, KLAB_REG_V2_WARPTILE=1
+```
+
+Build and verify the default champion:
+
+```bash
+CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
+
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 128 --n 128 --k 128
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 130 --n 129 --k 17
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 512 --n 512 --k 512
+```
+
+Official benchmark commands:
+
+```bash
+./build-cuda/kernellab compare --backends cuda_reg,cuda_reg_v2,cublas --m 2048 --n 2048 --k 2048 --warmup 3 --iterations 10 --csv-out results/autotune/final_2048.csv
+./build-cuda/kernellab compare --backends cuda_reg,cuda_reg_v2,cublas --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 10 --csv-out results/autotune/final_4096.csv
+```
+
+Re-run the focused/finalist sweep:
+
+```bash
+# Focused grid, 5 timed iterations per config.
+AUTOTUNE_FOCUS=1 AUTOTUNE_ITERS=5 AUTOTUNE_OUT=results/autotune/focused_sweep.csv \
+  scripts/run_cuda_reg_autotune_sweep.sh
+
+# Finalist grid, 5 timed iterations per config.
+AUTOTUNE_FOCUS=2 AUTOTUNE_ITERS=5 AUTOTUNE_OUT=results/autotune/finalist_sweep.csv \
+  scripts/run_cuda_reg_autotune_sweep.sh
+```
+
+Build with ptxas for the champion:
+
+```bash
+cmake -S . -B build-cuda-autotune-final \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DKERNELLAB_ENABLE_CUDA=ON \
+  -DKERNELLAB_BUILD_TESTS=OFF \
+  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
+  -DCUDAToolkit_ROOT=/usr/local/cuda-12.1 \
+  -DCMAKE_CUDA_FLAGS="--ptxas-options=-v"
+cmake --build build-cuda-autotune-final --target kernellab --clean-first 2>&1 | tee results/autotune/final_ptxas.log
+grep -A4 -B2 RegV2AutotunedKernel results/autotune/final_ptxas.log
+```
+
+NCU command for the champion:
+
+```bash
+/usr/local/cuda-12.1/bin/ncu \
+  --target-processes all \
+  --kernel-name regex:RegV2AutotunedKernel \
+  --launch-skip 3 \
+  --launch-count 1 \
+  --metrics launch__registers_per_thread,sm__warps_active.avg.pct_of_peak_sustained_active,l1tex__t_sectors_pipe_lsu_mem_local_op_ld.sum,l1tex__t_sectors_pipe_lsu_mem_local_op_st.sum,dram__throughput.avg.pct_of_peak_sustained_elapsed,lts__throughput.avg.pct_of_peak_sustained_elapsed,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum,l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_st.sum \
+  ./build-cuda/kernellab run --backend cuda_reg_v2 --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 1
+```
+
+## 6. 如果看到 spill
 
 如果 local memory load/store 明显大于 0，把 NCU 输出贴回给我。下一步不要先改 README 数字；优先比较两个回退方案：
 

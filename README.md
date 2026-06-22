@@ -55,6 +55,7 @@ All CUDA backend rows are verified against the fp64 `cpu_ref` oracle.
 | `cuda_reg_v2` Layer 2 double buffer |        3.81 |     9.90 | 36057  |        77 % |    ✓     |
 | `cuda_reg_v2` Layer 3 cp.async |        3.96 |     9.52 | 34726  |        74 % |    ✓     |
 | `cuda_reg_v2` Layer 4 warptiling |        3.86 |     9.04 | 35647  |        76 % |    ✓     |
+| `cuda_reg_v2` autotuned BK16 warptile |        3.51 |     8.60 | 39108  |        83 % |    ✓     |
 | `cublas`      |        2.94 |     8.01 | 46747  |       100 % |    ✓     |
 
 `cuda_smem` is **42 % faster than `cuda_naive`** because it reuses each
@@ -73,11 +74,11 @@ scheduling, or autotuning.
 percentage at smaller sizes mostly means cuBLAS hasn't fully warmed up
 its tile-selection heuristics.
 
-| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cuda_reg_v2` L1 float4 (GFLOPs / % cuBLAS) | `cuda_reg_v2` L2 double buffer (GFLOPs / % cuBLAS) | `cuda_reg_v2` L3 cp.async (GFLOPs / % cuBLAS) | `cuda_reg_v2` L4 warptiling (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
-| ----: | -------------------------------: | ------------------------------: | -----------------------------: | ------------------------------------------: | --------------------------------------------------: | ----------------------------------------------: | ------------------------------------------------: | ----------------: |
-|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               11983 / **36 %** |                         12468 / **38 %** |                                   12451 / **37 %** |                               15796 / **47 %** |                                 16252 / **49 %** |             33245 |
-|  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               33114 / **65 %** |                         34248 / **68 %** |                                   34979 / **69 %** |                               32828 / **65 %** |                                 34071 / **67 %** |             50949 |
-|  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33245 / **71 %** |                         36095 / **77 %** |                                   36057 / **77 %** |                               34726 / **74 %** |                                 35647 / **76 %** |             46811 |
+| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cuda_reg_v2` L1 float4 (GFLOPs / % cuBLAS) | `cuda_reg_v2` L2 double buffer (GFLOPs / % cuBLAS) | `cuda_reg_v2` L3 cp.async (GFLOPs / % cuBLAS) | `cuda_reg_v2` L4 warptiling (GFLOPs / % cuBLAS) | `cuda_reg_v2` autotuned (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
+| ----: | -------------------------------: | ------------------------------: | -----------------------------: | ------------------------------------------: | --------------------------------------------------: | ----------------------------------------------: | ------------------------------------------------: | --------------------------------------------: | ----------------: |
+|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               11983 / **36 %** |                         12468 / **38 %** |                                   12451 / **37 %** |                               15796 / **47 %** |                                 16252 / **49 %** |                                      not run |             33245 |
+|  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               32794 / **64 %** |                         34248 / **68 %** |                                   34979 / **69 %** |                               32828 / **65 %** |                                 34071 / **67 %** |                           37469 / **73 %** |             50986 |
+|  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33451 / **71 %** |                         36095 / **77 %** |                                   36057 / **77 %** |                               34726 / **74 %** |                                 35647 / **76 %** |                           39108 / **83 %** |             47086 |
 
 CPU baselines for context (1024³): `cpu_ref` (fp64 oracle, single-thread)
 0.29 GFLOPs; `cpu_omp` (parallel fp32) ~3.9 GFLOPs. cuBLAS at 4096³ hits
@@ -216,6 +217,7 @@ about **70.2%** of GPU kernel time in a 128-token `Qwen/Qwen2.5-1.5B` run.
 - [Adding a Backend](docs/adding-a-backend.md)
 - [Register Tiling Explained](docs/register_tiling_explained.md)
 - [cuda_reg_v2 Explained](docs/cuda_reg_v2_explained.md)
+- [cuda_reg_v2 Autotune Explained](docs/cuda_reg_autotune_explained.md)
 
 ## Developer Guardrails
 
