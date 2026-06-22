@@ -21,16 +21,8 @@ build-*/
 # Benchmark output and result snapshots
 results/
 results-*/
-!results/
-!results/transformer_gemm_atlas.csv
-!results/atlas_qwen.csv
-!results/kernel_breakdown.csv
-!results/nsys_cuda_gpu_kern_sum_cuda_gpu_kern_sum.csv
 
 # Nsight Systems traces can be large; commit exported stats/screenshots instead.
 traces/
-!traces/
-!traces/trace_qwen.nsys-rep
 *.nsys-rep
-!traces/trace_qwen.nsys-rep
 *.qdrep
