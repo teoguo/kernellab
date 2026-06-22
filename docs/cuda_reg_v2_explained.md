@@ -139,3 +139,82 @@ Shared memory doubled from 8320 bytes to 16640 bytes, exactly as expected. Regis
 - Why is there a barrier after compute? It proves all next-buffer loads are visible before any warp reads that buffer next iteration.
 - Why did it not improve much at 4096^3? Ordinary loads are still synchronous in each issuing warp, so this layer only gives scheduler-level latency hiding, not a true async copy pipeline.
 - Why continue to cp.async? `cp.async` is the mechanism that can make global-to-smem copy genuinely asynchronous and avoid extra register staging.
+
+## Layer 3: cp.async with row-major A staging
+
+### What changed
+
+Layer 3 replaces the ordinary global-to-shared loads with `cp.async` for the aligned hot path. The kernel still uses `BM=BN=128`, `BK=8`, `TM=TN=8`, 256 threads/block, and the same cudaEvent timing contract.
+
+The hard layout change is A:
+
+```text
+Layer 2 As: As[bk][row]        // compute-friendly transpose
+Layer 3 As: As[row][bk + pad]  // cp.async-friendly row-major staging
+```
+
+That change is required because `cp.async` can copy contiguous global bytes into contiguous shared-memory bytes, but it cannot transpose or scatter values while copying. A is row-major in global memory, so one row's K segment is contiguous. Each thread copies one 16-byte half-row of A and one 16-byte segment of B.
+
+The A row stride is `BK + 4 = 12` floats, plus a 4-float skew for alternating 8-row groups. The padding keeps each A row's shared-memory destination 16-byte aligned for `cp.async`; the skew avoids making the two row groups inside the current warp mapping repeatedly hit the same shared-memory banks.
+
+Boundary correctness needed one extra rule: only fully valid and 16-byte-aligned chunks use `cp.async`. Odd shapes such as `130x129x17` make many row starts unaligned, so those chunks fall back to scalar zero-fill stores. This keeps the fp64 oracle test correct without slowing the large aligned benchmark shapes.
+
+The copy pipeline is:
+
+1. issue async copies for tile 0 into buffer 0;
+2. `cp.async.commit_group`;
+3. `cp.async.wait_group 0`;
+4. `__syncthreads()` because wait is per-thread but the tile is cooperative;
+5. for each K tile, issue async copies for the next tile into the other buffer;
+6. compute the current tile while the next copy group is in flight;
+7. wait and synchronize before reading the next buffer.
+
+### Why it helps, and why it hurt here
+
+The intended win is real: `cp.async` moves global data directly into shared memory, avoiding register staging and enabling a true async copy group. That is better machinery than Layer 2's ordinary-load double buffering.
+
+The problem is the A layout tradeoff. Layer 2's transposed `As[bk][row]` let each thread load its 8 A values with two contiguous `float4` shared-memory reads. Layer 3's row-major `As[row][bk]` makes the compute loop read one fixed `bk` across 8 rows, so each thread performs 8 scalar A shared-memory reads per `bk`. The copy path improved, but the compute-side shared-memory instruction count and register pressure increased.
+
+### Expected vs measured
+
+Expected from the design doc: +3-5% over Layer 2 if async copy removes exposed load latency without damaging the compute loop.
+
+Measured results:
+
+| Size | cuda_reg_v2 Layer 3 GFLOPs | % cuBLAS | Verification |
+| ---: | -------------------------: | -------: | :----------: |
+| 1024^3 | 15795.9 | 47.1% | passed |
+| 2048^3 | 32827.9 | 64.5% | passed |
+| 4096^3 | 34726.2 | 74.2% | passed |
+
+Same-run comparison against `cuda_reg`:
+
+| Size | cuda_reg GFLOPs | cuda_reg_v2 L3 GFLOPs | Uplift |
+| ---: | --------------: | --------------------: | -----: |
+| 1024^3 | 12037.7 | 15795.9 | +31.2% |
+| 2048^3 | 32799.2 | 32827.9 | +0.1% |
+| 4096^3 | 33264.1 | 34726.2 | +4.4% |
+
+Against Layer 2, Layer 3 is a regression at the target 4096^3 size: 34726.2 GFLOPs vs Layer 2's 36056.5 GFLOPs. This layer is correct and useful as a learning checkpoint, but it is not the best-performing v2 checkpoint so far.
+
+### ptxas / NCU
+
+NCU is still blocked by `ERR_NVGPUCTRPERM`, so hardware counters such as achieved occupancy, local memory transactions, DRAM/L2 throughput, and shared bank conflicts are unavailable from this account.
+
+`ptxas --verbose` output:
+
+```text
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 129 registers, 20512 bytes smem, 388 bytes cmem[0]
+```
+
+There is no spill, but register pressure jumped from Layer 2's 109 registers/thread to 129 registers/thread. With 256 threads/block and a 65536-register SM, two resident blocks would need `2 * 256 * 129 = 66048` registers, slightly above the register file. That implies a one-block-per-SM register limit before any other scheduling limits are considered, which helps explain the 4096^3 slowdown.
+
+### Defense checklist
+
+- What is `cp.async`? It is an sm_80+ instruction that copies global memory to shared memory asynchronously, without first placing the loaded values in normal registers.
+- Why change `As` to row-major? `cp.async` can only copy contiguous bytes; it cannot perform the old A transpose scatter.
+- Why keep scalar fallback? Boundary shapes can make source pointers unaligned or partially valid. Issuing 16-byte `cp.async` there would be undefined or would read outside the matrix.
+- Why `commit_group` and `wait_group 0`? `commit_group` publishes the issued async copies as a group; `wait_group 0` waits until no committed group is pending before the tile is consumed.
+- Why still use `__syncthreads()` after wait? `wait_group` is per-thread. The tile is cooperatively loaded, so the block needs a barrier before every thread can safely read every other thread's copied data.
+- Why did 4096^3 regress? The row-major A layout increased compute-side shared-memory loads and pushed register use to 129/thread, reducing theoretical occupancy to one block/SM.

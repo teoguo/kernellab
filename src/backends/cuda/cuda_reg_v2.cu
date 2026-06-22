@@ -15,15 +15,15 @@ std::string FormatCudaError(const char* operation, const cudaError_t status) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
 }
 
-// cuda_reg_v2 Layer 2: cuda_reg's 128x128 register-tiled GEMM plus
-// float4 vectorized movement and ordinary-load shared-memory double
-// buffering.
+// cuda_reg_v2 Layer 3: cuda_reg's 128x128 register-tiled GEMM plus
+// float4 vectorized movement, double-buffered smem, and cp.async
+// global-to-smem copies on the hot tile load path.
 //
-// We intentionally keep the same BM/BN/BK/TM/TN shape as cuda_reg so
-// this layer isolates one idea: reduce load instruction count and make
-// aligned 128-bit transactions where the data layout naturally permits
-// them.  Correctness still wins over vectorization: edge tiles and
-// unaligned rows fall back to scalar loads/stores.
+// We intentionally keep the same BM/BN/BK/TM/TN shape as cuda_reg so the
+// layer isolates one idea: replace ordinary global loads with the
+// sm_80+ async copy pipeline.  Correctness still wins over speed: edge
+// tiles use cp.async's zero-fill source-size operand instead of reading
+// outside A/B.
 constexpr int kBlockM = 128;
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 8;
@@ -32,75 +32,128 @@ constexpr int kThreadN = 8;
 constexpr int kThreadsPerBlock = 256;
 constexpr int kThreadTilesN = kBlockN / kThreadN;
 constexpr int kFloat4Width = 4;
-constexpr int kAsStride = kBlockM + 4;
+
+// Layer 3 changes A's smem layout from transposed As[bk][row] to
+// row-major As[row][bk].  That is the key cp.async enabler: one A row
+// contains BK=8 contiguous floats in global memory, so each thread can
+// copy one 16-byte half-row directly into smem without unpacking.
+//
+// A plain stride of BK+1=9 would reduce bank conflicts, but row starts
+// would not all be 16-byte aligned, which is unsafe for 16-byte cp.async.
+// A stride of 12 floats keeps every row start 16-byte aligned.  The
+// extra 4-float group skew makes rows 8 apart land on different banks;
+// one warp currently covers two 8-row groups, so this avoids a steady
+// two-address/same-bank pattern when loading a_frag.
+constexpr int kAsStride = kBlockK + 4;
+constexpr int kAsGroupRows = kThreadM;
+constexpr int kAsGroupSkew = 4;
+constexpr int kAsSmemElements = (kBlockM * kAsStride) + kAsGroupSkew;
 
 __device__ bool IsAligned16(const float* pointer) {
   return (reinterpret_cast<std::uintptr_t>(pointer) % alignof(float4)) == 0;
 }
 
-__device__ void StoreFloat4(float* pointer, const float4 value) {
-  *reinterpret_cast<float4*>(pointer) = value;
+__device__ int ClampCopyBytes(const bool row_or_col_valid, const int remaining_floats) {
+  if (!row_or_col_valid || remaining_floats <= 0) {
+    return 0;
+  }
+  const int valid_floats = (remaining_floats < kFloat4Width) ? remaining_floats : kFloat4Width;
+  return valid_floats * static_cast<int>(sizeof(float));
 }
 
-__device__ void LoadTileFloat4(const float* __restrict__ a, const float* __restrict__ b,
-                               float* __restrict__ as_buffer, float* __restrict__ bs_buffer,
-                               int block_row, int block_col, int k_tile, int m, int n, int k) {
+__device__ unsigned int SharedAddress(const void* pointer) {
+  unsigned int address = 0;
+  asm("{ .reg .u64 shared_address; cvta.to.shared.u64 shared_address, %1; "
+      "cvt.u32.u64 %0, shared_address; }"
+      : "=r"(address)
+      : "l"(pointer));
+  return address;
+}
+
+__device__ void CpAsyncCopy16(float* smem_destination, const float* global_source,
+                              int valid_bytes) {
+  // cp.async copies 16 bytes from global memory to shared memory without
+  // first materializing the data in general-purpose registers.  The
+  // fourth operand is the number of valid source bytes.  When it is less
+  // than 16, the hardware zero-fills the remaining bytes, which is the
+  // clean way to keep edge tiles correct.
+  const unsigned int shared_destination = SharedAddress(smem_destination);
+  asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(shared_destination),
+               "l"(global_source), "r"(valid_bytes));
+}
+
+__device__ void StorePartialFloat4(float* smem_destination, const float* global_source,
+                                   int valid_bytes) {
+  // cp.async's fast path requires the source and destination to be
+  // aligned for the 16-byte copy.  Odd matrix widths such as K=17 or
+  // N=129 make later rows unaligned, so boundary tests must use a scalar
+  // zero-fill fallback rather than issuing undefined async copies.
+  const int valid_floats = valid_bytes / static_cast<int>(sizeof(float));
+#pragma unroll
+  for (int lane = 0; lane < kFloat4Width; ++lane) {
+    smem_destination[lane] = (lane < valid_floats) ? global_source[lane] : 0.0F;
+  }
+}
+
+__device__ void CopyFloat4ToSmem(float* smem_destination, const float* global_source,
+                                 int valid_bytes) {
+  if (valid_bytes == 16 && IsAligned16(global_source)) {
+    CpAsyncCopy16(smem_destination, global_source, valid_bytes);
+  } else {
+    StorePartialFloat4(smem_destination, global_source, valid_bytes);
+  }
+}
+
+__device__ void CpAsyncCommitGroup() {
+  // Commit closes the current batch of cp.async instructions.  Later
+  // wait_group calls reason about committed groups, not individual copy
+  // instructions.
+  asm volatile("cp.async.commit_group;\n" ::);
+}
+
+__device__ void CpAsyncWaitAll() {
+  // wait_group 0 means no committed cp.async group may remain pending.
+  // We pair this with __syncthreads() before consuming the smem buffer,
+  // because wait_group is per-thread while the tile is cooperative.
+  asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+__device__ int AsOffset(const int row, const int bk) {
+  const int group_skew = ((row / kAsGroupRows) & 1) * kAsGroupSkew;
+  return (row * kAsStride) + group_skew + bk;
+}
+
+__device__ void LoadTileCpAsync(const float* __restrict__ a, const float* __restrict__ b,
+                                float* __restrict__ as_buffer, float* __restrict__ bs_buffer,
+                                int block_row, int block_col, int k_tile, int m, int n, int k) {
   const int tid = threadIdx.x;
 
-  // Cooperative A load, vectorized across the K dimension.  Each thread
-  // owns one float4 from a row of A because BM*BK/4 = 256.  A is still
-  // stored transposed in smem, so the float4 global load is unpacked into
-  // four scalar stores to As[tile_k + lane][tile_row].
-  for (int linear = tid; linear < (kBlockM * kBlockK) / kFloat4Width;
-       linear += kThreadsPerBlock) {
-      const int tile_row = linear / (kBlockK / kFloat4Width);
-      const int tile_k = (linear % (kBlockK / kFloat4Width)) * kFloat4Width;
-      const int global_row = block_row + tile_row;
-      const int global_k = k_tile + tile_k;
-      float4 packed{0.0F, 0.0F, 0.0F, 0.0F};
-      if (global_row < m) {
-        const float* source = a + (global_row * k) + global_k;
-        if ((global_k + 3) < k && IsAligned16(source)) {
-          packed = *reinterpret_cast<const float4*>(source);
-        } else {
-          // Partial K tiles, such as K=17, still contain valid lanes.
-          // Load each in-range lane rather than zeroing the whole vector.
-          packed.x = (global_k + 0 < k) ? source[0] : 0.0F;
-          packed.y = (global_k + 1 < k) ? source[1] : 0.0F;
-          packed.z = (global_k + 2 < k) ? source[2] : 0.0F;
-          packed.w = (global_k + 3 < k) ? source[3] : 0.0F;
-        }
-      }
-      as_buffer[((tile_k + 0) * kAsStride) + tile_row] = packed.x;
-      as_buffer[((tile_k + 1) * kAsStride) + tile_row] = packed.y;
-      as_buffer[((tile_k + 2) * kAsStride) + tile_row] = packed.z;
-      as_buffer[((tile_k + 3) * kAsStride) + tile_row] = packed.w;
-  }
+  // Cooperative A load: BM*BK floats are exactly 256 float4 chunks, so
+  // each thread issues one cp.async.  This is why switching As to
+  // row-major matters: A[global_row][global_k:global_k+4] is contiguous
+  // in global memory and contiguous in shared memory.
+  const int a_tile_row = tid / (kBlockK / kFloat4Width);
+  const int a_tile_k = (tid % (kBlockK / kFloat4Width)) * kFloat4Width;
+  const int a_global_row = block_row + a_tile_row;
+  const int a_global_k = k_tile + a_tile_k;
+  const bool a_row_valid = a_global_row < m;
+  const int a_valid_bytes = ClampCopyBytes(a_row_valid, k - a_global_k);
+  const float* a_source =
+      (a_valid_bytes > 0) ? (a + (a_global_row * k) + a_global_k) : a;
+  CopyFloat4ToSmem(&as_buffer[AsOffset(a_tile_row, a_tile_k)], a_source, a_valid_bytes);
 
-  // Cooperative B load, vectorized across N.  Bs is row-major [BK][BN],
-  // so a float4 from global B can be written as a float4 into smem.
-  for (int linear = tid; linear < (kBlockK * kBlockN) / kFloat4Width;
-       linear += kThreadsPerBlock) {
-      const int tile_k = linear / (kBlockN / kFloat4Width);
-      const int tile_col = (linear % (kBlockN / kFloat4Width)) * kFloat4Width;
-      const int global_k = k_tile + tile_k;
-      const int global_col = block_col + tile_col;
-      float4 packed{0.0F, 0.0F, 0.0F, 0.0F};
-      if (global_k < k) {
-        const float* source = b + (global_k * n) + global_col;
-        if ((global_col + 3) < n && IsAligned16(source)) {
-          packed = *reinterpret_cast<const float4*>(source);
-        } else {
-          // Partial N edge tiles keep their valid lanes.  This is slower
-          // than float4 but only happens on boundary blocks.
-          packed.x = (global_col + 0 < n) ? source[0] : 0.0F;
-          packed.y = (global_col + 1 < n) ? source[1] : 0.0F;
-          packed.z = (global_col + 2 < n) ? source[2] : 0.0F;
-          packed.w = (global_col + 3 < n) ? source[3] : 0.0F;
-        }
-      }
-      StoreFloat4(&bs_buffer[(tile_k * kBlockN) + tile_col], packed);
-  }
+  // Cooperative B load: B is row-major across N, and Bs keeps the same
+  // [BK][BN] row-major layout, so the previous float4 path maps directly
+  // to one cp.async per thread.
+  const int b_tile_k = tid / (kBlockN / kFloat4Width);
+  const int b_tile_col = (tid % (kBlockN / kFloat4Width)) * kFloat4Width;
+  const int b_global_k = k_tile + b_tile_k;
+  const int b_global_col = block_col + b_tile_col;
+  const bool b_row_valid = b_global_k < k;
+  const int b_valid_bytes = ClampCopyBytes(b_row_valid, n - b_global_col);
+  const float* b_source =
+      (b_valid_bytes > 0) ? (b + (b_global_k * n) + b_global_col) : b;
+  CopyFloat4ToSmem(&bs_buffer[(b_tile_k * kBlockN) + b_tile_col], b_source, b_valid_bytes);
 }
 
 __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
@@ -111,27 +164,22 @@ __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
       float a_frag[kThreadM];
       float b_frag[kThreadN];
 
-      // Pull one A column fragment and one B row fragment from smem into
-      // registers using two float4 loads each.  row_base and col_base are
-      // multiples of 8, and kAsStride is 132, so these shared-memory
-      // addresses are 16-byte aligned.  The fragment is then unpacked
-      // into scalar arrays to keep the outer-product loop readable.
-      const float4 a0 =
-          *reinterpret_cast<const float4*>(&as_buffer[(bk * kAsStride) + row_base + 0]);
-      const float4 a1 =
-          *reinterpret_cast<const float4*>(&as_buffer[(bk * kAsStride) + row_base + 4]);
+      // Layer 3 reads A from row-major As[row][bk].  For a fixed bk, the
+      // 16 column-tiles in a half warp all read the same A element, which
+      // shared memory can broadcast.  The stride+skew above keeps the two
+      // row groups inside one warp from repeatedly landing on identical
+      // banks.
+#pragma unroll
+      for (int tm = 0; tm < kThreadM; ++tm) {
+        a_frag[tm] = as_buffer[AsOffset(row_base + tm, bk)];
+      }
+
+      // B remains contiguous across N, so each thread still uses two
+      // float4 smem reads for its 8-column fragment.
       const float4 b0 =
           *reinterpret_cast<const float4*>(&bs_buffer[(bk * kBlockN) + col_base + 0]);
       const float4 b1 =
           *reinterpret_cast<const float4*>(&bs_buffer[(bk * kBlockN) + col_base + 4]);
-      a_frag[0] = a0.x;
-      a_frag[1] = a0.y;
-      a_frag[2] = a0.z;
-      a_frag[3] = a0.w;
-      a_frag[4] = a1.x;
-      a_frag[5] = a1.y;
-      a_frag[6] = a1.z;
-      a_frag[7] = a1.w;
       b_frag[0] = b0.x;
       b_frag[1] = b0.y;
       b_frag[2] = b0.z;
@@ -154,14 +202,14 @@ __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
     }
 }
 
-__global__ void RegV2DoubleBufferedKernel(const float* __restrict__ a,
-                                          const float* __restrict__ b, float* __restrict__ c,
-                                          int m, int n, int k) {
-  // Layer 2 owns two copies of each smem tile.  While buffer 0 is being
-  // consumed by the outer-product compute loop, buffer 1 can hold the
-  // next K tile, and vice versa.  This doubles smem from ~8 KB to ~16 KB
-  // but keeps the same register-tiled math and timing contract.
-  __shared__ __align__(16) float as[2][kBlockK][kAsStride];
+__global__ void RegV2CpAsyncKernel(const float* __restrict__ a,
+                                   const float* __restrict__ b, float* __restrict__ c, int m,
+                                   int n, int k) {
+  // Layer 3 still owns two copies of each smem tile, but global-to-smem
+  // movement now uses cp.async.  A is flat because each row has an
+  // explicit padded/skewed offset rather than a simple rectangular C
+  // array layout.
+  __shared__ __align__(16) float as[2][kAsSmemElements];
   __shared__ __align__(16) float bs[2][kBlockK][kBlockN];
 
   const int tid = threadIdx.x;
@@ -183,9 +231,12 @@ __global__ void RegV2DoubleBufferedKernel(const float* __restrict__ a,
     }
   }
 
-  // Prologue: every thread cooperatively loads the first K tile into
-  // buffer 0.  The barrier makes that buffer visible before compute.
-  LoadTileFloat4(a, b, &as[0][0][0], &bs[0][0][0], block_row, block_col, 0, m, n, k);
+  // Prologue: issue the first async copy group, wait for it, then use a
+  // CTA-wide barrier.  cp.async wait is per-thread; __syncthreads makes
+  // the cooperatively filled tile visible to every thread.
+  LoadTileCpAsync(a, b, &as[0][0], &bs[0][0][0], block_row, block_col, 0, m, n, k);
+  CpAsyncCommitGroup();
+  CpAsyncWaitAll();
   __syncthreads();
 
   int current_buffer = 0;
@@ -193,23 +244,26 @@ __global__ void RegV2DoubleBufferedKernel(const float* __restrict__ a,
     const int next_k_tile = k_tile + kBlockK;
     const int next_buffer = 1 - current_buffer;
 
-    // Ordinary global loads are still synchronous inside a thread, but
-    // putting the next tile in the opposite buffer before computing the
-    // current tile lets the scheduler overlap some load stalls from one
-    // warp with arithmetic from another warp.  The following barrier is
-    // the handoff: after compute, all next-buffer loads must be visible.
+    // Pipeline body: issue async copies for K+BK into the opposite
+    // buffer, commit that group, then compute the current buffer while
+    // the copy engine moves the next tile.  This is the difference from
+    // Layer 2: the load is not a normal register-producing instruction.
     if (next_k_tile < k) {
-      LoadTileFloat4(a, b, &as[next_buffer][0][0], &bs[next_buffer][0][0], block_row, block_col,
-                     next_k_tile, m, n, k);
+      LoadTileCpAsync(a, b, &as[next_buffer][0], &bs[next_buffer][0][0], block_row, block_col,
+                      next_k_tile, m, n, k);
+      CpAsyncCommitGroup();
     }
 
-    ComputeTileFromSmem(&as[current_buffer][0][0], &bs[current_buffer][0][0], row_base, col_base,
+    ComputeTileFromSmem(&as[current_buffer][0], &bs[current_buffer][0][0], row_base, col_base,
                         acc);
 
-    // Do not let any warp start consuming next_buffer until all warps
-    // have finished loading it.  The same barrier also prevents the next
-    // loop iteration from overwriting current_buffer too early.
-    __syncthreads();
+    // Wait only when a next tile was issued.  wait_group 0 proves the
+    // async group has finished; the barrier proves all threads are done
+    // reading current_buffer before the next loop can reuse it.
+    if (next_k_tile < k) {
+      CpAsyncWaitAll();
+      __syncthreads();
+    }
     current_buffer = next_buffer;
   }
 
@@ -303,8 +357,8 @@ private:
       const dim3 block(kThreadsPerBlock);
       const dim3 grid(static_cast<unsigned int>((c.cols() + kBlockN - 1) / kBlockN),
                       static_cast<unsigned int>((c.rows() + kBlockM - 1) / kBlockM));
-      RegV2DoubleBufferedKernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_,
-                                                             n_, k_);
+      RegV2CpAsyncKernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_, n_,
+                                                      k_);
 
       const cudaError_t launch_status = cudaGetLastError();
       if (launch_status != cudaSuccess) {
