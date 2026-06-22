@@ -25,6 +25,7 @@ std::size_t CudaFloatMatrixBytes(std::int64_t rows, std::int64_t cols) noexcept;
 
 BackendPtr MakeCudaNaiveBackend();
 BackendPtr MakeCudaSmemBackend();
+BackendPtr MakeCudaRegBackend();
 BackendPtr MakeCublasBackend();
 
 } // namespace kernellab

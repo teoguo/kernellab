@@ -159,6 +159,10 @@ BackendPtr MakeCudaSmemBackend() {
   return std::make_unique<UnavailableBackend>("cuda_smem");
 }
 
+BackendPtr MakeCudaRegBackend() {
+  return std::make_unique<UnavailableBackend>("cuda_reg");
+}
+
 BackendPtr MakeCublasBackend() {
   return std::make_unique<UnavailableBackend>("cublas");
 }

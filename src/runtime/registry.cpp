@@ -38,6 +38,7 @@ BackendRegistry CreateDefaultRegistry() {
   registry.Register(MakeCpuOmpBackend());
   registry.Register(MakeCudaNaiveBackend());
   registry.Register(MakeCudaSmemBackend());
+  registry.Register(MakeCudaRegBackend());
   registry.Register(MakeCublasBackend());
   return registry;
 }

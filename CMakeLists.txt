@@ -86,6 +86,7 @@ if(KERNELLAB_CUDA_ENABLED)
     PRIVATE
       src/backends/cuda/cuda_naive.cu
       src/backends/cuda/cuda_smem.cu
+      src/backends/cuda/cuda_reg.cu
       src/backends/cuda/cublas_backend.cpp)
   set_target_properties(kernellab_core PROPERTIES
     CUDA_STANDARD 17

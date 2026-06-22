@@ -16,6 +16,7 @@ and trust every number you read along the way.
 | `cpu_omp`     | Adds `#pragma omp parallel for collapse(2)`. Built only when OpenMP is found.     |
 | `cuda_naive`  | One thread per output element. No reuse, no shared memory.                        |
 | `cuda_smem`   | 32×32 shared-memory tile + per-thread accumulator. Bank-conflict-free layout.     |
+| `cuda_reg`    | 128×128 block tile + 8×8 per-thread register tile. FP32 CUDA, no Tensor Cores.    |
 | `cublas`      | `cublasSgemm` on a persistent handle, pinned to `CUBLAS_PEDANTIC_MATH`. Production fp32 reference. |
 
 CPU-only builds work by default when CUDA is unavailable. CUDA backends are enabled automatically when CMake finds a usable CUDA toolchain and `KERNELLAB_ENABLE_CUDA=ON`.
@@ -42,20 +43,23 @@ multiple sizes through `kernellab compare`.
 
 ### Headline — M = N = K = 4096, fp32, 10 timed iterations after 3 warmup
 
-All three CUDA backends verified against the fp64 `cpu_ref` oracle.
+All CUDA backend rows are verified against the fp64 `cpu_ref` oracle.
 
 | Backend       | Kernel (ms) | E2E (ms) | GFLOPs | % of cuBLAS | Verified |
 | ------------- | ----------: | -------: | -----: | ----------: | :------: |
-| `cuda_naive`  |        26.4 |     32.6 |  5206  |        11 % |    ✓     |
-| `cuda_smem`   |    **18.6** | **23.8** | **7378** |    **16 %** |    ✓     |
-| `cublas`      |        2.98 |     8.13 | 46121  |       100 % |    ✓     |
+| `cuda_naive`  |       26.28 |    31.36 |  5231  |        11 % |    ✓     |
+| `cuda_smem`   |       18.50 |    23.57 |  7428  |        16 % |    ✓     |
+| `cuda_reg`    |        4.09 |     9.17 | 33628  |        72 % |    ✓     |
+| `cublas`      |        2.94 |     8.01 | 46747  |       100 % |    ✓     |
 
-`cuda_smem` is **42 % faster than `cuda_naive`** — the win comes
-entirely from reusing each global-memory load `BM = 32` times through
-shared memory instead of re-fetching K floats from gmem per output
-element. The remaining 6× gap to cuBLAS is the cost of *not* having
-register blocking, vectorized smem loads, or Tensor Cores — known
-next rungs that build on the same session pattern.
+`cuda_smem` is **42 % faster than `cuda_naive`** because it reuses each
+global-memory load through shared memory. `cuda_reg` adds an 8×8
+per-thread register tile, so each shared-memory operand feeds a small
+outer product before leaving registers; at 4096³ it is **4.5× faster
+than `cuda_smem`** and reaches **72 % of the strict fp32 cuBLAS row**.
+The remaining gap is expected: this kernel still has no double
+buffering, vectorized smem/global-memory movement, assembly-level
+scheduling, or autotuning.
 
 ### Size sweep
 
@@ -64,11 +68,11 @@ next rungs that build on the same session pattern.
 percentage at smaller sizes mostly means cuBLAS hasn't fully warmed up
 its tile-selection heuristics.
 
-| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
-| ----: | -------------------------------: | ------------------------------: | ----------------: |
-|  1024 |                  5325 / **15 %** |                 6233 / **18 %** |             34840 |
-|  2048 |                  5533 / **11 %** |                 6961 / **14 %** |             50493 |
-|  4096 |                  5206 / **11 %** |                 7378 / **16 %** |             46121 |
+| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
+| ----: | -------------------------------: | ------------------------------: | -----------------------------: | ----------------: |
+|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               12469 / **34 %** |             36399 |
+|  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               32884 / **65 %** |             50723 |
+|  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33628 / **72 %** |             46747 |
 
 CPU baselines for context (1024³): `cpu_ref` (fp64 oracle, single-thread)
 0.29 GFLOPs; `cpu_omp` (parallel fp32) ~3.9 GFLOPs. cuBLAS at 4096³ hits
@@ -205,6 +209,7 @@ about **70.2%** of GPU kernel time in a 128-token `Qwen/Qwen2.5-1.5B` run.
 - [LLM GEMM Atlas](docs/atlas.md)
 - [Methodology](docs/methodology.md)
 - [Adding a Backend](docs/adding-a-backend.md)
+- [Register Tiling Explained](docs/register_tiling_explained.md)
 
 ## Developer Guardrails
 

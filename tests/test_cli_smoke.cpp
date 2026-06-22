@@ -131,6 +131,7 @@ void TestListBackendsPrintsStableAvailabilityLines() {
   KERNELLAB_CHECK(exit_code == 0);
   KERNELLAB_CHECK(stdout_text.find("cpu_ref\ttrue\tavailable") != std::string::npos);
   KERNELLAB_CHECK(stdout_text.find("cpu_naive\ttrue\tavailable") != std::string::npos);
+  KERNELLAB_CHECK(stdout_text.find("cuda_reg\t") != std::string::npos);
   KERNELLAB_CHECK(stderr_text.empty());
 }
 
