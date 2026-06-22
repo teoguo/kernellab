@@ -17,6 +17,7 @@ and trust every number you read along the way.
 | `cuda_naive`  | One thread per output element. No reuse, no shared memory.                        |
 | `cuda_smem`   | 32×32 shared-memory tile + per-thread accumulator. Bank-conflict-free layout.     |
 | `cuda_reg`    | 128×128 block tile + 8×8 per-thread register tile. FP32 CUDA, no Tensor Cores.    |
+| `cuda_reg_v2` | Layered `cuda_reg` successor. Current layer: float4 vectorized load path.         |
 | `cublas`      | `cublasSgemm` on a persistent handle, pinned to `CUBLAS_PEDANTIC_MATH`. Production fp32 reference. |
 
 CPU-only builds work by default when CUDA is unavailable. CUDA backends are enabled automatically when CMake finds a usable CUDA toolchain and `KERNELLAB_ENABLE_CUDA=ON`.
@@ -50,6 +51,7 @@ All CUDA backend rows are verified against the fp64 `cpu_ref` oracle.
 | `cuda_naive`  |       26.28 |    31.36 |  5231  |        11 % |    ✓     |
 | `cuda_smem`   |       18.50 |    23.57 |  7428  |        16 % |    ✓     |
 | `cuda_reg`    |        4.09 |     9.17 | 33628  |        72 % |    ✓     |
+| `cuda_reg_v2` Layer 1 float4 |        3.81 |     8.89 | 36095  |        77 % |    ✓     |
 | `cublas`      |        2.94 |     8.01 | 46747  |       100 % |    ✓     |
 
 `cuda_smem` is **42 % faster than `cuda_naive`** because it reuses each
@@ -68,11 +70,11 @@ scheduling, or autotuning.
 percentage at smaller sizes mostly means cuBLAS hasn't fully warmed up
 its tile-selection heuristics.
 
-| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
-| ----: | -------------------------------: | ------------------------------: | -----------------------------: | ----------------: |
-|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               12469 / **34 %** |             36399 |
-|  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               32884 / **65 %** |             50723 |
-|  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33628 / **72 %** |             46747 |
+| M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cuda_reg_v2` L1 float4 (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
+| ----: | -------------------------------: | ------------------------------: | -----------------------------: | ------------------------------------------: | ----------------: |
+|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               12061 / **36 %** |                         12468 / **38 %** |             33247 |
+|  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               32813 / **65 %** |                         34248 / **68 %** |             50540 |
+|  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33245 / **71 %** |                         36095 / **77 %** |             46708 |
 
 CPU baselines for context (1024³): `cpu_ref` (fp64 oracle, single-thread)
 0.29 GFLOPs; `cpu_omp` (parallel fp32) ~3.9 GFLOPs. cuBLAS at 4096³ hits
@@ -210,6 +212,7 @@ about **70.2%** of GPU kernel time in a 128-token `Qwen/Qwen2.5-1.5B` run.
 - [Methodology](docs/methodology.md)
 - [Adding a Backend](docs/adding-a-backend.md)
 - [Register Tiling Explained](docs/register_tiling_explained.md)
+- [cuda_reg_v2 Explained](docs/cuda_reg_v2_explained.md)
 
 ## Developer Guardrails
 

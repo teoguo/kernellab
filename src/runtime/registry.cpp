@@ -39,6 +39,7 @@ BackendRegistry CreateDefaultRegistry() {
   registry.Register(MakeCudaNaiveBackend());
   registry.Register(MakeCudaSmemBackend());
   registry.Register(MakeCudaRegBackend());
+  registry.Register(MakeCudaRegV2Backend());
   registry.Register(MakeCublasBackend());
   return registry;
 }

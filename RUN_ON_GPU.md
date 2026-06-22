@@ -73,6 +73,18 @@ CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
 ./build-cuda/kernellab compare --backends cuda_naive,cuda_smem,cuda_reg,cublas --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 10
 ```
 
+For `cuda_reg_v2` layer work, compare the stable baseline, current v2 layer, and cuBLAS:
+
+```bash
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 128 --n 128 --k 128
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 130 --n 129 --k 17
+./build-cuda/kernellab verify --backend cuda_reg_v2 --m 512 --n 512 --k 512
+
+./build-cuda/kernellab compare --backends cuda_reg,cuda_reg_v2,cublas --m 1024 --n 1024 --k 1024 --warmup 3 --iterations 10 --csv-out results/cuda_reg_v2_layer_current_1024.csv
+./build-cuda/kernellab compare --backends cuda_reg,cuda_reg_v2,cublas --m 2048 --n 2048 --k 2048 --warmup 3 --iterations 10 --csv-out results/cuda_reg_v2_layer_current_2048.csv
+./build-cuda/kernellab compare --backends cuda_reg,cuda_reg_v2,cublas --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 10 --csv-out results/cuda_reg_v2_layer_current_4096.csv
+```
+
 可选：同时导出 CSV，方便回填 README：
 
 ```bash
