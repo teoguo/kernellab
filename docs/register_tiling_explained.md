@@ -1,6 +1,6 @@
 # cuda_reg register tiling 逐步讲解
 
-这份文档是给作者学习和面试答辩用的。`cuda_reg` 的目标不是“赢 cuBLAS”，而是在 `cuda_naive -> cuda_smem -> cuda_reg -> cublas` 这条优化阶梯里，把“为什么 register tiling 是下一步”讲清楚，并且让代码能逐行辩护。
+`cuda_reg` 的目标不是“赢 cuBLAS”，而是在 `cuda_naive -> cuda_smem -> cuda_reg -> cublas` 这条优化阶梯里，把“为什么 register tiling 是下一步”讲清楚，并且让代码实现足够直接、可审查。
 
 ## 1. 这个 kernel 在算什么
 
@@ -39,7 +39,7 @@ shared As:  As[bk][row]
 
 compute 阶段每个线程固定一个 `bk`，然后取自己 8 行的 A fragment：`As[bk][row_base + 0..7]`。这让内层读变成沿着 shared-memory row 的连续访问。对 warp 来说，很多线程会读相同或相邻的 A 地址，硬件可以 broadcast/multicast，bank conflict 风险比直接用 `[BM][BK]` 布局低。
 
-一句话答辩：As 转置不是为了改变数学，而是为了让“计算时的访问模式”更顺。GEMM 的热路径是 K 内层反复读 smem，应该优先照顾这条路径。
+一句话总结：As 转置不是为了改变数学，而是为了让“计算时的访问模式”更顺。GEMM 的热路径是 K 内层反复读 smem，应该优先照顾这条路径。
 
 ## 4. register tiling 为什么提高 arithmetic intensity
 
@@ -91,7 +91,7 @@ compute 阶段每个线程固定一个 `bk`，然后取自己 8 行的 A fragmen
 
 ## 8. 为什么仍然不及 cuBLAS
 
-`cuda_reg` 是教学/简历项目里的清晰优化台阶，不是工业 SGEMM。它仍然没有：
+`cuda_reg` 是一个清晰的 register-tiling backend，不是工业级 SGEMM。它仍然没有：
 
 - double buffering：不能把下一块 global->smem 的加载和当前块计算重叠；
 - vectorized load/store：没有显式 `float4` 或更强的内存搬运优化；
@@ -103,7 +103,7 @@ compute 阶段每个线程固定一个 `bk`，然后取自己 8 行的 A fragmen
 
 ## 9. 当前实测状态
 
-远程实测环境：`c2smarter-MS-7D69`，CUDA 12.1 build，NVIDIA driver 580.126.09，RTX 6000 Ada。由于系统 CMake 是 3.22.1，而项目要求 3.28+，实测时在 NAS user base 安装了 `cmake 3.31.10`，没有使用 sudo。
+实测环境：Linux x86_64，CUDA 12.1 build，NVIDIA driver 580.126.09，RTX 6000 Ada。项目要求 CMake 3.28+；若系统版本较低，可把新版 CMake 安装到当前用户目录。
 
 正确性：
 

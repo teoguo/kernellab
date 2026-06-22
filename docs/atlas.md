@@ -28,11 +28,11 @@ Environment used for the committed results:
 
 | Item | Value |
 | --- | --- |
-| Host | `c2smarter-MS-7D69` |
+| Host | Linux x86_64 workstation |
 | GPU | NVIDIA RTX 6000 Ada Generation |
 | Driver | 580.126.09 |
 | System CUDA | 13.0 |
-| Profiling tool | Nsight Systems 2023.1.2 via `/usr/local/cuda-12.1/bin/nsys` |
+| Profiling tool | Nsight Systems 2023.1.2 via `$CUDA_ROOT/bin/nsys` |
 | Python env | conda `kernellab-atlas-cu121` |
 | PyTorch | `2.5.1+cu121` |
 | PyTorch CUDA runtime | 12.1 |
@@ -71,12 +71,14 @@ a token-by-token decode loop. NVTX ranges label `prefill`, `decode_loop`, and
 The profile command was:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 /usr/local/cuda-12.1/bin/nsys profile \
+export CUDA_ROOT=${CUDA_ROOT:-/usr/local/cuda-12.1}
+
+CUDA_VISIBLE_DEVICES=0 $CUDA_ROOT/bin/nsys profile \
   -o traces/trace_qwen \
   --force-overwrite=true \
   --capture-range=cudaProfilerApi \
   --cuda-memory-usage=true \
-  /home/c2smarter/anaconda3/bin/conda run -n kernellab-atlas-cu121 \
+  conda run -n kernellab-atlas-cu121 \
     python atlas/infer_with_profile.py \
       --model Qwen/Qwen2.5-1.5B \
       --max-new-tokens 128

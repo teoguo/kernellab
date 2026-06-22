@@ -15,9 +15,8 @@ std::string FormatCudaError(const char* operation, const cudaError_t status) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
 }
 
-// Autotune knobs.  The defaults are a sensible occupancy-first candidate,
-// but the remote sweep overrides these with nvcc -D flags so every
-// configuration is built as a separate compile-time specialization.
+// Build-time tuning knobs.  Defaults are the best measured RTX 6000 Ada
+// configuration; the sweep script overrides them with nvcc -D flags.
 #ifndef KLAB_REG_V2_BM
 #define KLAB_REG_V2_BM 128
 #endif
@@ -57,14 +56,11 @@ __device__ bool IsAligned16(const float* pointer) {
   return (reinterpret_cast<std::uintptr_t>(pointer) % alignof(float4)) == 0;
 }
 
-template <int BM, int BN, int BK, int TM, int TN>
-struct RegV2Config {
+template <int BM, int BN, int BK, int TM, int TN> struct RegV2Config {
   static constexpr int kThreads = (BM * BN) / (TM * TN);
   static constexpr int kThreadTilesN = BN / TN;
-  // As is intentionally transposed: As[bk][row].  That keeps each
-  // thread's A fragment contiguous during compute, which was the winning
-  // L1 float4 design.  +4 preserves 16-byte alignment for float4 smem
-  // reads while avoiding a plain 128-float bank stride.
+  // Transposed A keeps compute-time fragment reads contiguous.  +4 keeps
+  // rows 16-byte aligned for float4 reads without using a 128-float stride.
   static constexpr int kAsStride = BM + 4;
 };
 
@@ -75,10 +71,7 @@ __device__ void LoadTileFloat4(const float* __restrict__ a, const float* __restr
   using Config = RegV2Config<BM, BN, BK, TM, TN>;
   const int tid = threadIdx.x;
 
-  // A is row-major in global memory, so a thread reads a contiguous
-  // float4 along K.  It then scatters those four lanes into transposed
-  // shared memory As[bk][row].  This scatter is the price we pay to make
-  // compute-side A reads contiguous and cheap.
+  // Read A as contiguous float4 values along K, then scatter to As[bk][row].
   for (int linear = tid; linear < (BM * BK) / kFloat4Width; linear += Config::kThreads) {
     const int tile_row = linear / (BK / kFloat4Width);
     const int tile_k = (linear % (BK / kFloat4Width)) * kFloat4Width;
@@ -102,8 +95,7 @@ __device__ void LoadTileFloat4(const float* __restrict__ a, const float* __restr
     as_buffer[((tile_k + 3) * Config::kAsStride) + tile_row] = packed.w;
   }
 
-  // B stays row-major in shared memory: Bs[bk][col].  Global B is also
-  // contiguous along N, so full tiles use a direct float4 load/store.
+  // B is contiguous along N in both global and shared memory.
   for (int linear = tid; linear < (BK * BN) / kFloat4Width; linear += Config::kThreads) {
     const int tile_k = linear / (BN / kFloat4Width);
     const int tile_col = (linear % (BN / kFloat4Width)) * kFloat4Width;
@@ -127,17 +119,15 @@ __device__ void LoadTileFloat4(const float* __restrict__ a, const float* __restr
 
 template <int BM, int BN, int BK, int TM, int TN>
 __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
-                                    const float* __restrict__ bs_buffer, int row_base,
-                                    int col_base, float acc[TM][TN]) {
+                                    const float* __restrict__ bs_buffer, int row_base, int col_base,
+                                    float acc[TM][TN]) {
   using Config = RegV2Config<BM, BN, BK, TM, TN>;
 #pragma unroll
   for (int bk = 0; bk < BK; ++bk) {
     float a_frag[TM];
     float b_frag[TN];
 
-    // Fragment loads stay vectorized for all sweeped TM/TN values
-    // (4 or 8).  This keeps the L1 float4 benefit while the sweep changes
-    // accumulator count and therefore register pressure.
+    // Fragment loads stay vectorized while the sweep changes accumulator count.
 #pragma unroll
     for (int tm = 0; tm < TM; tm += kFloat4Width) {
       const float4 packed =
@@ -167,9 +157,11 @@ __device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
 }
 
 template <int BM, int BN, int BK, int TM, int TN>
-__global__ __launch_bounds__(RegV2Config<BM, BN, BK, TM, TN>::kThreads, 2)
-    void RegV2AutotunedKernel(const float* __restrict__ a, const float* __restrict__ b,
-                              float* __restrict__ c, int m, int n, int k) {
+__global__ __launch_bounds__(RegV2Config<BM, BN, BK, TM, TN>::kThreads,
+                             2) void RegV2AutotunedKernel(const float* __restrict__ a,
+                                                          const float* __restrict__ b,
+                                                          float* __restrict__ c, int m, int n,
+                                                          int k) {
   using Config = RegV2Config<BM, BN, BK, TM, TN>;
   __shared__ __align__(16) float as[BK][Config::kAsStride];
   __shared__ __align__(16) float bs[BK][BN];
@@ -178,12 +170,8 @@ __global__ __launch_bounds__(RegV2Config<BM, BN, BK, TM, TN>::kThreads, 2)
   const int block_row = blockIdx.y * BM;
   const int block_col = blockIdx.x * BN;
 #if KLAB_REG_V2_WARPTILE
-  // Optional controlled warptiling experiment.  It keeps the same
-  // transposed-As/float4 compute path and only changes ownership of
-  // thread tiles: eight warps cover a 2x4 grid of 64x32 warp tiles.
-  // This is deliberately guarded by a macro because it must earn its
-  // place by benchmark without pushing registers past the 2-block/SM
-  // budget.
+  // Optional warp-tile ownership map: eight warps cover a 2x4 grid of
+  // 64x32 subtiles while the load and compute path stays unchanged.
   static_assert(BM == 128 && BN == 128 && TM == 8 && TN == 8,
                 "current warptile mapping is defined for the 128x128 8x8 finalist");
   constexpr int kWarpSize = 32;
@@ -217,16 +205,15 @@ __global__ __launch_bounds__(RegV2Config<BM, BN, BK, TM, TN>::kThreads, 2)
   }
 
   for (int k_tile = 0; k_tile < k; k_tile += BK) {
-    LoadTileFloat4<BM, BN, BK, TM, TN>(a, b, &as[0][0], &bs[0][0], block_row, block_col, k_tile,
-                                       m, n, k);
+    LoadTileFloat4<BM, BN, BK, TM, TN>(a, b, &as[0][0], &bs[0][0], block_row, block_col, k_tile, m,
+                                       n, k);
     __syncthreads();
 
     ComputeTileFromSmem<BM, BN, BK, TM, TN>(&as[0][0], &bs[0][0], row_base, col_base, acc);
     __syncthreads();
   }
 
-  // Store this thread's TMxTN micro-tile.  Guards make non-multiple M/N/K sizes
-  // correct; out-of-range A/B elements were zero-padded during loads.
+  // Store this thread's TMxTN micro-tile; guards handle edge tiles.
 #pragma unroll
   for (int tm = 0; tm < TM; ++tm) {
     const int global_row = block_row + row_base + tm;

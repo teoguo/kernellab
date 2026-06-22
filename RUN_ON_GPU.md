@@ -1,35 +1,38 @@
 # RUN_ON_GPU.md
 
-在远程 Linux + RTX 6000 Ada 机器上执行以下命令。假设你已经在 `kernellab-atlas-work` repo 根目录，并且分支是 `feat/cuda-reg-v2`。
+在 Linux + RTX 6000 Ada 机器上执行以下命令。假设你已经在 repo 根目录，并且分支是 `feat/cuda-reg-autotune`。
 
 ## 0. 确认环境
 
 ```bash
+export WORKDIR=${WORKDIR:-$PWD}
+export CUDA_ROOT=${CUDA_ROOT:-/usr/local/cuda-12.1}
+export PYTHONUSERBASE=${PYTHONUSERBASE:-$HOME/.local}
+export PATH="$PYTHONUSERBASE/bin:$PATH"
+
 git status --short --branch
 nvidia-smi
-/usr/local/cuda-12.1/bin/nvcc --version
+$CUDA_ROOT/bin/nvcc --version
 ```
 
-如果 CUDA 12.1 不在 `/usr/local/cuda-12.1`，把下面命令里的 `CUDA_ROOT` 改成实际路径。
+如果 CUDA 12.1 不在 `/usr/local/cuda-12.1`，把 `CUDA_ROOT` 改成实际路径。
 
 ## 1. Build: CUDA 12.1
 
 基于现有 `scripts/build_cuda.sh`：
 
 ```bash
-CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
+CUDA_ROOT=$CUDA_ROOT ./scripts/build_cuda.sh build-cuda
 ```
 
-如果 workstation 上系统 CMake 低于项目要求的 3.28，不要用 sudo。可以把新版 CMake 装到 NAS user base：
+如果系统 CMake 低于项目要求的 3.28，不需要 sudo；可以把新版 CMake 装到当前用户目录：
 
 ```bash
-mkdir -p /home/mnt/nas/c2smarter/python-userbase
-PYTHONUSERBASE=/home/mnt/nas/c2smarter/python-userbase \
-  python3 -m pip install --user "cmake>=3.28,<4"
+mkdir -p "$PYTHONUSERBASE"
+PYTHONUSERBASE=$PYTHONUSERBASE python3 -m pip install --user "cmake>=3.28,<4"
 
-export PYTHONUSERBASE=/home/mnt/nas/c2smarter/python-userbase
-export PATH=/home/mnt/nas/c2smarter/python-userbase/bin:$PATH
-CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
+export PATH="$PYTHONUSERBASE/bin:$PATH"
+CUDA_ROOT=$CUDA_ROOT ./scripts/build_cuda.sh build-cuda
 ```
 
 确认 backend 注册：
@@ -109,7 +112,7 @@ mkdir -p results
 
 ```bash
 mkdir -p results
-/usr/local/cuda-12.1/bin/ncu --set full \
+$CUDA_ROOT/bin/ncu --set full \
   --target-processes all \
   --kernel-name regex:RegTiledKernel \
   --launch-skip 3 \
@@ -126,7 +129,7 @@ mkdir -p results
 再跑 metric-focused profile，直接抓答辩需要的指标：
 
 ```bash
-/usr/local/cuda-12.1/bin/ncu \
+$CUDA_ROOT/bin/ncu \
   --target-processes all \
   --kernel-name regex:RegTiledKernel \
   --launch-skip 3 \
@@ -146,7 +149,7 @@ mkdir -p results
 如果 metric 名称因 NCU 版本不兼容，先查可用 metric：
 
 ```bash
-/usr/local/cuda-12.1/bin/ncu --query-metrics | grep -E "registers_per_thread|warps_active|mem_local|throughput|bank_conflicts"
+$CUDA_ROOT/bin/ncu --query-metrics | grep -E "registers_per_thread|warps_active|mem_local|throughput|bank_conflicts"
 ```
 
 如果 NCU 返回 `ERR_NVGPUCTRPERM`，说明普通用户没有 performance counter 权限。不要用 sudo 或改 driver 设置；记录这个限制，并用 `--ptxas-options=-v` 补充 registers/spill 的编译证据：
@@ -156,8 +159,8 @@ cmake -S . -B build-cuda-ptxas \
   -DCMAKE_BUILD_TYPE=Release \
   -DKERNELLAB_ENABLE_CUDA=ON \
   -DKERNELLAB_BUILD_TESTS=OFF \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-12.1 \
+  -DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc \
+  -DCUDAToolkit_ROOT=$CUDA_ROOT \
   -DCMAKE_CUDA_FLAGS="--ptxas-options=-v"
 cmake --build build-cuda-ptxas --target kernellab_core --clean-first 2>&1 | tee results/ptxas_cuda_reg_build.log
 grep -A4 -B2 RegTiledKernel results/ptxas_cuda_reg_build.log
@@ -168,7 +171,7 @@ For `cuda_reg_v2`, use the current layer's kernel name. Layer 3 uses
 
 ```bash
 # Layer 3 cp.async
-/usr/local/cuda-12.1/bin/ncu \
+$CUDA_ROOT/bin/ncu \
   --target-processes all \
   --kernel-name regex:RegV2CpAsyncKernel \
   --launch-skip 3 \
@@ -177,7 +180,7 @@ For `cuda_reg_v2`, use the current layer's kernel name. Layer 3 uses
   ./build-cuda/kernellab run --backend cuda_reg_v2 --m 4096 --n 4096 --k 4096 --warmup 3 --iterations 1
 
 # Layer 4 warptiling
-/usr/local/cuda-12.1/bin/ncu \
+$CUDA_ROOT/bin/ncu \
   --target-processes all \
   --kernel-name regex:RegV2WarpTiledKernel \
   --launch-skip 3 \
@@ -203,7 +206,7 @@ BM=128, BN=128, BK=16, TM=8, TN=8, KLAB_REG_V2_WARPTILE=1
 Build and verify the default champion:
 
 ```bash
-CUDA_ROOT=/usr/local/cuda-12.1 ./scripts/build_cuda.sh build-cuda
+CUDA_ROOT=$CUDA_ROOT ./scripts/build_cuda.sh build-cuda
 
 ./build-cuda/kernellab verify --backend cuda_reg_v2 --m 128 --n 128 --k 128
 ./build-cuda/kernellab verify --backend cuda_reg_v2 --m 130 --n 129 --k 17
@@ -236,8 +239,8 @@ cmake -S . -B build-cuda-autotune-final \
   -DCMAKE_BUILD_TYPE=Release \
   -DKERNELLAB_ENABLE_CUDA=ON \
   -DKERNELLAB_BUILD_TESTS=OFF \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-12.1 \
+  -DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc \
+  -DCUDAToolkit_ROOT=$CUDA_ROOT \
   -DCMAKE_CUDA_FLAGS="--ptxas-options=-v"
 cmake --build build-cuda-autotune-final --target kernellab --clean-first 2>&1 | tee results/autotune/final_ptxas.log
 grep -A4 -B2 RegV2AutotunedKernel results/autotune/final_ptxas.log
@@ -246,7 +249,7 @@ grep -A4 -B2 RegV2AutotunedKernel results/autotune/final_ptxas.log
 NCU command for the champion:
 
 ```bash
-/usr/local/cuda-12.1/bin/ncu \
+$CUDA_ROOT/bin/ncu \
   --target-processes all \
   --kernel-name regex:RegV2AutotunedKernel \
   --launch-skip 3 \

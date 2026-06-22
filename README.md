@@ -1,11 +1,11 @@
 # kernellab
 
-A C++17 / CUDA testbed for **honest** fp32 GEMM measurement — kernel time
-separated from end-to-end time, a fp64-accumulating CPU oracle, a session
-abstraction that hoists allocation / H2D / handle creation out of the
-timed loop, and a stable versioned report schema. Designed so you can
-walk one optimization step at a time from a naive kernel toward cuBLAS
-and trust every number you read along the way.
+A C++17 / CUDA testbed for reproducible fp32 GEMM measurement: kernel
+time is separated from end-to-end time, correctness is checked against
+an fp64-accumulating CPU oracle, allocation / H2D / handle setup live in
+`Backend::Prepare()`, and reports use a stable versioned schema. The
+CUDA backends form a step-by-step optimization path from a naive kernel
+to shared-memory tiling, register tiling, autotuning, and cuBLAS.
 
 ## Backends
 
@@ -17,7 +17,7 @@ and trust every number you read along the way.
 | `cuda_naive`  | One thread per output element. No reuse, no shared memory.                        |
 | `cuda_smem`   | 32×32 shared-memory tile + per-thread accumulator. Bank-conflict-free layout.     |
 | `cuda_reg`    | 128×128 block tile + 8×8 per-thread register tile. FP32 CUDA, no Tensor Cores.    |
-| `cuda_reg_v2` | Layered `cuda_reg` successor. Current layer: warp-tiled cp.async experiment.     |
+| `cuda_reg_v2` | Autotuned register-tiled CUDA SGEMM. Current default: BK=16 + warp-tiled mapping. |
 | `cublas`      | `cublasSgemm` on a persistent handle, pinned to `CUBLAS_PEDANTIC_MATH`. Production fp32 reference. |
 
 CPU-only builds work by default when CUDA is unavailable. CUDA backends are enabled automatically when CMake finds a usable CUDA toolchain and `KERNELLAB_ENABLE_CUDA=ON`.
@@ -28,8 +28,8 @@ CPU-only builds work by default when CUDA is unavailable. CUDA backends are enab
 - Linux `x86_64` CUDA build on the perf-test host: CUDA 12.1, CMake
   3.28.3, `g++ 11.4.0`, RTX 6000 Ada (sm_89). Build paths in
   `scripts/build_cuda.sh` accept any `CUDA_ROOT` (defaults to
-  `/usr/local/cuda-13.0` for the originally-targeted host; override
-  via env var as shown in the build section).
+  `/usr/local/cuda-13.0`; override via env var as shown in the build
+  section).
 
 On systems where CUDA is installed but `nvcc` is not on `PATH`, pass an explicit CUDA compiler path during configure or use the helper script below.
 
@@ -45,6 +45,9 @@ multiple sizes through `kernellab compare`.
 ### Headline — M = N = K = 4096, fp32, 10 timed iterations after 3 warmup
 
 All CUDA backend rows are verified against the fp64 `cpu_ref` oracle.
+Nsight Compute hardware counters were unavailable on the measured host
+because of `ERR_NVGPUCTRPERM`; register/shared-memory/spill data for the
+custom CUDA kernels comes from `ptxas --verbose` logs.
 
 | Backend       | Kernel (ms) | E2E (ms) | GFLOPs | % of cuBLAS | Verified |
 | ------------- | ----------: | -------: | -----: | ----------: | :------: |
@@ -62,10 +65,10 @@ All CUDA backend rows are verified against the fp64 `cpu_ref` oracle.
 global-memory load through shared memory. `cuda_reg` adds an 8×8
 per-thread register tile, so each shared-memory operand feeds a small
 outer product before leaving registers; at 4096³ it is **4.5× faster
-than `cuda_smem`** and reaches **72 % of the strict fp32 cuBLAS row**.
-The remaining gap is expected: this kernel still has no double
-buffering, vectorized smem/global-memory movement, assembly-level
-scheduling, or autotuning.
+than `cuda_smem`** and reaches **72 % of strict fp32 cuBLAS**.
+`cuda_reg_v2` keeps the same fp32 math and adds vectorized tile
+movement, occupancy-aware autotuning, BK=16, and a warp-tiled mapping;
+the best measured configuration reaches **83 % of cuBLAS** at 4096³.
 
 ### Size sweep
 
@@ -76,7 +79,7 @@ its tile-selection heuristics.
 
 | M=N=K | `cuda_naive` (GFLOPs / % cuBLAS) | `cuda_smem` (GFLOPs / % cuBLAS) | `cuda_reg` (GFLOPs / % cuBLAS) | `cuda_reg_v2` L1 float4 (GFLOPs / % cuBLAS) | `cuda_reg_v2` L2 double buffer (GFLOPs / % cuBLAS) | `cuda_reg_v2` L3 cp.async (GFLOPs / % cuBLAS) | `cuda_reg_v2` L4 warptiling (GFLOPs / % cuBLAS) | `cuda_reg_v2` autotuned (GFLOPs / % cuBLAS) | `cublas` (GFLOPs) |
 | ----: | -------------------------------: | ------------------------------: | -----------------------------: | ------------------------------------------: | --------------------------------------------------: | ----------------------------------------------: | ------------------------------------------------: | --------------------------------------------: | ----------------: |
-|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               11983 / **36 %** |                         12468 / **38 %** |                                   12451 / **37 %** |                               15796 / **47 %** |                                 16252 / **49 %** |                                      not run |             33245 |
+|  1024 |                  5383 / **15 %** |                 6241 / **17 %** |               11983 / **36 %** |                         12468 / **38 %** |                                   12451 / **37 %** |                               15796 / **47 %** |                                 16252 / **49 %** |                                 not measured |             33245 |
 |  2048 |                  5537 / **11 %** |                 6945 / **14 %** |               32794 / **64 %** |                         34248 / **68 %** |                                   34979 / **69 %** |                               32828 / **65 %** |                                 34071 / **67 %** |                           37469 / **73 %** |             50986 |
 |  4096 |                  5231 / **11 %** |                 7428 / **16 %** |               33451 / **71 %** |                         36095 / **77 %** |                                   36057 / **77 %** |                               34726 / **74 %** |                                 35647 / **76 %** |                           39108 / **83 %** |             47086 |
 
@@ -84,11 +87,11 @@ CPU baselines for context (1024³): `cpu_ref` (fp64 oracle, single-thread)
 0.29 GFLOPs; `cpu_omp` (parallel fp32) ~3.9 GFLOPs. cuBLAS at 4096³ hits
 ~51 % of theoretical fp32 peak on this device.
 
-### What the numbers buy
+### Measurement notes
 
 This is the value of the v2 foundations:
 
-1. **`kernel_ms` is honest**. Because `Backend::Prepare()` runs once and
+1. **`kernel_ms` is kernel-only time**. Because `Backend::Prepare()` runs once and
    sinks `cudaMalloc` + H2D + cuBLAS handle creation into setup, every
    `kernel_ms` reported is just `cudaEvent`-bracketed kernel time — no
    amortized allocation contamination. cuBLAS at 4096³ shows
@@ -144,8 +147,8 @@ cmake -S . -B build-cuda \
   -DCMAKE_BUILD_TYPE=Release \
   -DKERNELLAB_ENABLE_CUDA=ON \
   -DKERNELLAB_BUILD_TESTS=ON \
-  -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
-  -DCUDAToolkit_ROOT=/usr/local/cuda-12.1
+  -DCMAKE_CUDA_COMPILER=$CUDA_ROOT/bin/nvcc \
+  -DCUDAToolkit_ROOT=$CUDA_ROOT
 cmake --build build-cuda
 ctest --test-dir build-cuda --output-on-failure
 ```
@@ -215,8 +218,11 @@ about **70.2%** of GPU kernel time in a 128-token `Qwen/Qwen2.5-1.5B` run.
 - [LLM GEMM Atlas](docs/atlas.md)
 - [Methodology](docs/methodology.md)
 - [Adding a Backend](docs/adding-a-backend.md)
+- [Register Tiling Design](docs/register_tiling_design.md)
 - [Register Tiling Explained](docs/register_tiling_explained.md)
+- [cuda_reg_v2 Design](docs/cuda_reg_v2_design.md)
 - [cuda_reg_v2 Explained](docs/cuda_reg_v2_explained.md)
+- [cuda_reg_v2 Autotune Design](docs/cuda_reg_autotune_design.md)
 - [cuda_reg_v2 Autotune Explained](docs/cuda_reg_autotune_explained.md)
 
 ## Developer Guardrails

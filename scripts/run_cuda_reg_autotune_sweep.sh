@@ -4,7 +4,8 @@ set -u
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
-export PYTHONUSERBASE="${PYTHONUSERBASE:-/home/mnt/nas/c2smarter/python-userbase}"
+export CUDA_ROOT="${CUDA_ROOT:-/usr/local/cuda-12.1}"
+export PYTHONUSERBASE="${PYTHONUSERBASE:-$HOME/.local}"
 export PATH="${PYTHONUSERBASE}/bin:${PATH}"
 
 mkdir -p results/autotune
@@ -52,8 +53,8 @@ for cfg in "${configs[@]}"; do
       -DCMAKE_BUILD_TYPE=Release \
       -DKERNELLAB_ENABLE_CUDA=ON \
       -DKERNELLAB_BUILD_TESTS=OFF \
-      -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.1/bin/nvcc \
-      -DCUDAToolkit_ROOT=/usr/local/cuda-12.1 \
+      -DCMAKE_CUDA_COMPILER="${CUDA_ROOT}/bin/nvcc" \
+      -DCUDAToolkit_ROOT="${CUDA_ROOT}" \
       -DCMAKE_CUDA_FLAGS="$flags" >/dev/null; then
     echo "$name,$bm,$bn,$bk,$tm,$tn,$threads,,,,,,,,,,,,,,,,cmake_failed" >> "$out"
     continue

@@ -14,13 +14,9 @@ std::string FormatCudaError(const char* operation, const cudaError_t status) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
 }
 
-// cuda_reg: 128x128 block tile + 8x8 per-thread register tile.
-//
-// One block computes a 128x128 tile of C.  The block has 256 threads;
-// each thread owns one 8x8 micro-tile, so 16x16 thread tiles cover the
-// whole block tile.  This is the next rung after cuda_smem: instead of
-// one thread producing one C element, each thread keeps 64 partial sums
-// in registers and reuses each smem operand across a small outer product.
+// One block computes a 128x128 tile of C.  Each of 256 threads owns one
+// 8x8 register tile, so each shared-memory operand is reused across a
+// small outer product instead of producing only one C element.
 constexpr int kBlockM = 128;
 constexpr int kBlockN = 128;
 constexpr int kBlockK = 8;
@@ -31,32 +27,24 @@ constexpr int kThreadTilesN = kBlockN / kThreadN;
 
 __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restrict__ b,
                                float* __restrict__ c, int m, int n, int k) {
-  // As is stored transposed: original A tile [BM][BK] becomes [BK][BM].
-  // In the compute loop, all threads read a fixed bk row and nearby M
-  // columns, which turns the per-thread A fragment into bank-friendly
-  // row reads.  The +1 padding breaks store/load bank-alignment patterns
-  // caused by BM=128 being a multiple of 32 banks.
+  // A is stored as As[bk][row].  The compute loop reads fixed-bk rows,
+  // and +1 padding avoids a 128-float stride through the 32 smem banks.
   __shared__ float as[kBlockK][kBlockM + 1];
 
-  // Bs is already consumed as [BK][BN], so row-major shared memory keeps
-  // both cooperative loads and compute-time reads simple and coalesced.
+  // B is consumed as Bs[bk][col], matching the row-major global layout.
   __shared__ float bs[kBlockK][kBlockN];
 
   const int tid = threadIdx.x;
   const int block_row = blockIdx.y * kBlockM;
   const int block_col = blockIdx.x * kBlockN;
 
-  // Map the 1D thread id to a 16x16 grid of micro-tiles.  Consecutive
-  // thread ids move across N first, matching CUDA's warp layout and
-  // giving adjacent threads adjacent B/C columns.
+  // Map the 1D thread id to a 16x16 grid of 8x8 micro-tiles.
   const int thread_tile_row = tid / kThreadTilesN;
   const int thread_tile_col = tid % kThreadTilesN;
   const int row_base = thread_tile_row * kThreadM;
   const int col_base = thread_tile_col * kThreadN;
 
-  // 64 fp32 accumulators live in registers.  This is the whole point of
-  // register tiling: after one A value and one B value are fetched from
-  // smem, they are reused for an 8x8 outer product before touching C.
+  // 64 fp32 accumulators stay in registers for the whole K loop.
   float acc[kThreadM][kThreadN];
 #pragma unroll
   for (int tm = 0; tm < kThreadM; ++tm) {
@@ -67,9 +55,8 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
   }
 
   for (int k_tile = 0; k_tile < k; k_tile += kBlockK) {
-    // Cooperative A load.  We iterate the original [BM][BK] tile in
-    // row-major order so each warp reads short contiguous chunks from A.
-    // The store is transposed to as[bk][row] for bank-friendly compute.
+    // Load A in row-major order, then transpose into shared memory for
+    // the compute-time access pattern.
     for (int linear = tid; linear < kBlockM * kBlockK; linear += kThreadsPerBlock) {
       const int tile_row = linear / kBlockK;
       const int tile_k = linear % kBlockK;
@@ -79,9 +66,7 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
           (global_row < m && global_k < k) ? a[(global_row * k) + global_k] : 0.0F;
     }
 
-    // Cooperative B load.  B's tile layout [BK][BN] matches global
-    // row-major order for each bk row, so consecutive threads load and
-    // store adjacent columns.
+    // Load B as row-major Bs[bk][col].
     for (int linear = tid; linear < kBlockK * kBlockN; linear += kThreadsPerBlock) {
       const int tile_k = linear / kBlockN;
       const int tile_col = linear % kBlockN;
@@ -91,8 +76,7 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
           (global_k < k && global_col < n) ? b[(global_k * n) + global_col] : 0.0F;
     }
 
-    // Every thread must wait until the whole A/B K-slice is resident in
-    // shared memory before any thread starts reusing it for its 8x8 tile.
+    // Wait until the complete K-slice is visible in shared memory.
     __syncthreads();
 
 #pragma unroll
@@ -100,9 +84,7 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
       float a_frag[kThreadM];
       float b_frag[kThreadN];
 
-      // Pull one A column fragment and one B row fragment from smem into
-      // registers.  Each a_frag value is reused across TN columns; each
-      // b_frag value is reused across TM rows.
+      // Stage one A fragment and one B fragment in registers.
 #pragma unroll
       for (int tm = 0; tm < kThreadM; ++tm) {
         a_frag[tm] = as[bk][row_base + tm];
@@ -112,9 +94,7 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
         b_frag[tn] = bs[bk][col_base + tn];
       }
 
-      // Register-resident outer product.  These 64 FMAs are why smem
-      // arithmetic intensity rises: one A smem read feeds 8 columns, and
-      // one B smem read feeds 8 rows.
+      // Register-resident outer product.
 #pragma unroll
       for (int tm = 0; tm < kThreadM; ++tm) {
 #pragma unroll
@@ -124,9 +104,7 @@ __global__ void RegTiledKernel(const float* __restrict__ a, const float* __restr
       }
     }
 
-    // The same shared-memory buffers are reused for the next K-slice.
-    // This barrier prevents a fast warp from overwriting As/Bs while a
-    // slower warp is still consuming the current slice.
+    // Do not overwrite As/Bs for the next K-slice until all warps finish.
     __syncthreads();
   }
 

@@ -1,6 +1,6 @@
 # cuda_reg_v2 explained
 
-`cuda_reg_v2` is the experimental path above the verified `cuda_reg` baseline. The baseline stays untouched so it remains the honest fallback. Each layer below must pass the fp64 `cpu_ref` oracle on `128^3`, `130x129x17`, and `512^3` before the next layer starts.
+`cuda_reg_v2` is the experimental path above the verified `cuda_reg` baseline. The baseline stays untouched so the optimization ladder remains comparable. Each layer below must pass the fp64 `cpu_ref` oracle on `128^3`, `130x129x17`, and `512^3` before the next layer starts.
 
 ## Layer 1: float4 vectorized load path
 
@@ -28,7 +28,7 @@ The original `cuda_reg` already has high arithmetic intensity because each smem 
 
 Expected from the design doc: roughly +5-8% over `cuda_reg` if load instruction count is a meaningful bottleneck.
 
-Measured on `c2smarter-MS-7D69` / RTX 6000 Ada / CUDA 12.1:
+Measured on RTX 6000 Ada / CUDA 12.1:
 
 | Size | cuda_reg_v2 Layer 1 GFLOPs | % cuBLAS | Verification |
 | ---: | -------------------------: | -------: | :----------: |
@@ -118,7 +118,7 @@ Same-run uplift over `cuda_reg`:
 | 2048^3 | 32996.6 | 34979.4 | +6.0% |
 | 4096^3 | 33187.9 | 36056.5 | +8.6% |
 
-Layer 2 is essentially flat versus Layer 1 at 4096^3: 36056.5 GFLOPs vs Layer 1's 36094.7 GFLOPs. The honest interpretation is that ordinary-load double buffering did not add meaningful overlap for the largest square GEMM. It did not break correctness, and it keeps the door open for Layer 3 `cp.async`, where the copy can actually be asynchronous and can avoid staging through registers.
+Layer 2 is essentially flat versus Layer 1 at 4096^3: 36056.5 GFLOPs vs Layer 1's 36094.7 GFLOPs. The likely explanation is that ordinary-load double buffering did not add meaningful overlap for the largest square GEMM. It did not break correctness, and it keeps the door open for Layer 3 `cp.async`, where the copy can actually be asynchronous and can avoid staging through registers.
 
 ### ptxas / NCU
 
@@ -276,7 +276,7 @@ Same-run comparison against `cuda_reg`:
 | 2048^3 | 33113.8 | 34071.0 | +2.9% |
 | 4096^3 | 33244.7 | 35646.9 | +7.2% |
 
-Layer 4 improves over Layer 3 at every measured size, including 4096^3: 35646.9 GFLOPs vs 34726.2 GFLOPs. It still does not beat Layer 2 at the target size: Layer 2 measured 36056.5 GFLOPs. The honest conclusion is that the warp mapping helped, but not enough to repay the row-major A staging and high register pressure introduced for cp.async.
+Layer 4 improves over Layer 3 at every measured size, including 4096^3: 35646.9 GFLOPs vs 34726.2 GFLOPs. It still does not beat Layer 2 at the target size: Layer 2 measured 36056.5 GFLOPs. The measured conclusion is that the warp mapping helped, but not enough to repay the row-major A staging and high register pressure introduced for cp.async.
 
 ### ptxas / NCU
 
