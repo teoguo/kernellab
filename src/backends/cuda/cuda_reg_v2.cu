@@ -15,8 +15,9 @@ std::string FormatCudaError(const char* operation, const cudaError_t status) {
   return std::string(operation) + " failed: " + cudaGetErrorString(status);
 }
 
-// cuda_reg_v2 Layer 1: cuda_reg's 128x128 register-tiled GEMM plus
-// float4 vectorized movement on the hot load paths.
+// cuda_reg_v2 Layer 2: cuda_reg's 128x128 register-tiled GEMM plus
+// float4 vectorized movement and ordinary-load shared-memory double
+// buffering.
 //
 // We intentionally keep the same BM/BN/BK/TM/TN shape as cuda_reg so
 // this layer isolates one idea: reduce load instruction count and make
@@ -41,50 +42,17 @@ __device__ void StoreFloat4(float* pointer, const float4 value) {
   *reinterpret_cast<float4*>(pointer) = value;
 }
 
-__global__ void RegV2Float4Kernel(const float* __restrict__ a, const float* __restrict__ b,
-                               float* __restrict__ c, int m, int n, int k) {
-  // As is still transposed: original A tile [BM][BK] becomes [BK][BM].
-  // Layer 1 changes the padding from +1 to +4.  +4 keeps every As row
-  // 16-byte aligned for float4 smem->register reads while still breaking
-  // the exact 128-float stride that can line up poorly with 32 banks.
-  __shared__ __align__(16) float as[kBlockK][kAsStride];
-
-  // Bs is already consumed as [BK][BN], so row-major shared memory keeps
-  // both cooperative loads and compute-time reads simple and coalesced.
-  __shared__ __align__(16) float bs[kBlockK][kBlockN];
-
+__device__ void LoadTileFloat4(const float* __restrict__ a, const float* __restrict__ b,
+                               float* __restrict__ as_buffer, float* __restrict__ bs_buffer,
+                               int block_row, int block_col, int k_tile, int m, int n, int k) {
   const int tid = threadIdx.x;
-  const int block_row = blockIdx.y * kBlockM;
-  const int block_col = blockIdx.x * kBlockN;
 
-  // Map the 1D thread id to a 16x16 grid of micro-tiles.  Consecutive
-  // thread ids move across N first, matching CUDA's warp layout and
-  // giving adjacent threads adjacent B/C columns.
-  const int thread_tile_row = tid / kThreadTilesN;
-  const int thread_tile_col = tid % kThreadTilesN;
-  const int row_base = thread_tile_row * kThreadM;
-  const int col_base = thread_tile_col * kThreadN;
-
-  // 64 fp32 accumulators live in registers.  This is the whole point of
-  // register tiling: after one A value and one B value are fetched from
-  // smem, they are reused for an 8x8 outer product before touching C.
-  float acc[kThreadM][kThreadN];
-#pragma unroll
-  for (int tm = 0; tm < kThreadM; ++tm) {
-#pragma unroll
-    for (int tn = 0; tn < kThreadN; ++tn) {
-      acc[tm][tn] = 0.0F;
-    }
-  }
-
-  for (int k_tile = 0; k_tile < k; k_tile += kBlockK) {
-    // Cooperative A load, vectorized across the K dimension.  Each
-    // thread owns one float4 from a row of A because BM*BK/4 = 256.
-    // A must be stored transposed in smem, so the float4 global load is
-    // unpacked into four scalar stores to As[tile_k + lane][tile_row].
-    // For odd K or edge rows, scalar fallback preserves correctness.
-    for (int linear = tid; linear < (kBlockM * kBlockK) / kFloat4Width;
-         linear += kThreadsPerBlock) {
+  // Cooperative A load, vectorized across the K dimension.  Each thread
+  // owns one float4 from a row of A because BM*BK/4 = 256.  A is still
+  // stored transposed in smem, so the float4 global load is unpacked into
+  // four scalar stores to As[tile_k + lane][tile_row].
+  for (int linear = tid; linear < (kBlockM * kBlockK) / kFloat4Width;
+       linear += kThreadsPerBlock) {
       const int tile_row = linear / (kBlockK / kFloat4Width);
       const int tile_k = (linear % (kBlockK / kFloat4Width)) * kFloat4Width;
       const int global_row = block_row + tile_row;
@@ -103,17 +71,16 @@ __global__ void RegV2Float4Kernel(const float* __restrict__ a, const float* __re
           packed.w = (global_k + 3 < k) ? source[3] : 0.0F;
         }
       }
-      as[tile_k + 0][tile_row] = packed.x;
-      as[tile_k + 1][tile_row] = packed.y;
-      as[tile_k + 2][tile_row] = packed.z;
-      as[tile_k + 3][tile_row] = packed.w;
-    }
+      as_buffer[((tile_k + 0) * kAsStride) + tile_row] = packed.x;
+      as_buffer[((tile_k + 1) * kAsStride) + tile_row] = packed.y;
+      as_buffer[((tile_k + 2) * kAsStride) + tile_row] = packed.z;
+      as_buffer[((tile_k + 3) * kAsStride) + tile_row] = packed.w;
+  }
 
-    // Cooperative B load, vectorized across N.  Bs is row-major [BK][BN],
-    // so a float4 from global B can be written as a float4 into smem.
-    // The edge fallback zero-pads partial tiles just like cuda_reg.
-    for (int linear = tid; linear < (kBlockK * kBlockN) / kFloat4Width;
-         linear += kThreadsPerBlock) {
+  // Cooperative B load, vectorized across N.  Bs is row-major [BK][BN],
+  // so a float4 from global B can be written as a float4 into smem.
+  for (int linear = tid; linear < (kBlockK * kBlockN) / kFloat4Width;
+       linear += kThreadsPerBlock) {
       const int tile_k = linear / (kBlockN / kFloat4Width);
       const int tile_col = (linear % (kBlockN / kFloat4Width)) * kFloat4Width;
       const int global_k = k_tile + tile_k;
@@ -132,13 +99,13 @@ __global__ void RegV2Float4Kernel(const float* __restrict__ a, const float* __re
           packed.w = (global_col + 3 < n) ? source[3] : 0.0F;
         }
       }
-      StoreFloat4(&bs[tile_k][tile_col], packed);
-    }
+      StoreFloat4(&bs_buffer[(tile_k * kBlockN) + tile_col], packed);
+  }
+}
 
-    // Every thread must wait until the whole A/B K-slice is resident in
-    // shared memory before any thread starts reusing it for its 8x8 tile.
-    __syncthreads();
-
+__device__ void ComputeTileFromSmem(const float* __restrict__ as_buffer,
+                                    const float* __restrict__ bs_buffer, int row_base,
+                                    int col_base, float acc[kThreadM][kThreadN]) {
 #pragma unroll
     for (int bk = 0; bk < kBlockK; ++bk) {
       float a_frag[kThreadM];
@@ -149,10 +116,14 @@ __global__ void RegV2Float4Kernel(const float* __restrict__ a, const float* __re
       // multiples of 8, and kAsStride is 132, so these shared-memory
       // addresses are 16-byte aligned.  The fragment is then unpacked
       // into scalar arrays to keep the outer-product loop readable.
-      const float4 a0 = *reinterpret_cast<const float4*>(&as[bk][row_base + 0]);
-      const float4 a1 = *reinterpret_cast<const float4*>(&as[bk][row_base + 4]);
-      const float4 b0 = *reinterpret_cast<const float4*>(&bs[bk][col_base + 0]);
-      const float4 b1 = *reinterpret_cast<const float4*>(&bs[bk][col_base + 4]);
+      const float4 a0 =
+          *reinterpret_cast<const float4*>(&as_buffer[(bk * kAsStride) + row_base + 0]);
+      const float4 a1 =
+          *reinterpret_cast<const float4*>(&as_buffer[(bk * kAsStride) + row_base + 4]);
+      const float4 b0 =
+          *reinterpret_cast<const float4*>(&bs_buffer[(bk * kBlockN) + col_base + 0]);
+      const float4 b1 =
+          *reinterpret_cast<const float4*>(&bs_buffer[(bk * kBlockN) + col_base + 4]);
       a_frag[0] = a0.x;
       a_frag[1] = a0.y;
       a_frag[2] = a0.z;
@@ -181,11 +152,65 @@ __global__ void RegV2Float4Kernel(const float* __restrict__ a, const float* __re
         }
       }
     }
+}
 
-    // The same shared-memory buffers are reused for the next K-slice.
-    // This barrier prevents a fast warp from overwriting As/Bs while a
-    // slower warp is still consuming the current slice.
+__global__ void RegV2DoubleBufferedKernel(const float* __restrict__ a,
+                                          const float* __restrict__ b, float* __restrict__ c,
+                                          int m, int n, int k) {
+  // Layer 2 owns two copies of each smem tile.  While buffer 0 is being
+  // consumed by the outer-product compute loop, buffer 1 can hold the
+  // next K tile, and vice versa.  This doubles smem from ~8 KB to ~16 KB
+  // but keeps the same register-tiled math and timing contract.
+  __shared__ __align__(16) float as[2][kBlockK][kAsStride];
+  __shared__ __align__(16) float bs[2][kBlockK][kBlockN];
+
+  const int tid = threadIdx.x;
+  const int block_row = blockIdx.y * kBlockM;
+  const int block_col = blockIdx.x * kBlockN;
+
+  // Map the 1D thread id to a 16x16 grid of 8x8 micro-tiles.
+  const int thread_tile_row = tid / kThreadTilesN;
+  const int thread_tile_col = tid % kThreadTilesN;
+  const int row_base = thread_tile_row * kThreadM;
+  const int col_base = thread_tile_col * kThreadN;
+
+  float acc[kThreadM][kThreadN];
+#pragma unroll
+  for (int tm = 0; tm < kThreadM; ++tm) {
+#pragma unroll
+    for (int tn = 0; tn < kThreadN; ++tn) {
+      acc[tm][tn] = 0.0F;
+    }
+  }
+
+  // Prologue: every thread cooperatively loads the first K tile into
+  // buffer 0.  The barrier makes that buffer visible before compute.
+  LoadTileFloat4(a, b, &as[0][0][0], &bs[0][0][0], block_row, block_col, 0, m, n, k);
+  __syncthreads();
+
+  int current_buffer = 0;
+  for (int k_tile = 0; k_tile < k; k_tile += kBlockK) {
+    const int next_k_tile = k_tile + kBlockK;
+    const int next_buffer = 1 - current_buffer;
+
+    // Ordinary global loads are still synchronous inside a thread, but
+    // putting the next tile in the opposite buffer before computing the
+    // current tile lets the scheduler overlap some load stalls from one
+    // warp with arithmetic from another warp.  The following barrier is
+    // the handoff: after compute, all next-buffer loads must be visible.
+    if (next_k_tile < k) {
+      LoadTileFloat4(a, b, &as[next_buffer][0][0], &bs[next_buffer][0][0], block_row, block_col,
+                     next_k_tile, m, n, k);
+    }
+
+    ComputeTileFromSmem(&as[current_buffer][0][0], &bs[current_buffer][0][0], row_base, col_base,
+                        acc);
+
+    // Do not let any warp start consuming next_buffer until all warps
+    // have finished loading it.  The same barrier also prevents the next
+    // loop iteration from overwriting current_buffer too early.
     __syncthreads();
+    current_buffer = next_buffer;
   }
 
   // Store the 8x8 micro-tile.  Guards make non-multiple M/N/K sizes
@@ -278,7 +303,8 @@ private:
       const dim3 block(kThreadsPerBlock);
       const dim3 grid(static_cast<unsigned int>((c.cols() + kBlockN - 1) / kBlockN),
                       static_cast<unsigned int>((c.rows() + kBlockM - 1) / kBlockM));
-      RegV2Float4Kernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_, n_, k_);
+      RegV2DoubleBufferedKernel<<<grid, block, 0, stream_>>>(device_a_, device_b_, device_c_, m_,
+                                                             n_, k_);
 
       const cudaError_t launch_status = cudaGetLastError();
       if (launch_status != cudaSuccess) {

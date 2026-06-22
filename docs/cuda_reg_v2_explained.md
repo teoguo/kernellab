@@ -70,3 +70,72 @@ Compared with `cuda_reg` baseline ptxas (`128 registers`, `8224 bytes smem`, `0 
 - Why keep `As` transposed? Compute still reads fixed-`bk` rows from shared memory; transposed `As[bk][row]` keeps the inner-loop fragment contiguous.
 - Why change padding to `+4`? `+1` breaks bank stride but misaligns later rows for `float4`; `+4` keeps 16-byte row alignment and still avoids a 128-float stride.
 - Why scalar fallback? Real verification includes odd sizes; vectorization must never be allowed to read invalid memory or change the fp32 math.
+
+## Layer 2: ordinary-load double buffering
+
+### What changed
+
+Layer 2 keeps Layer 1's float4 load path and opens two shared-memory buffers:
+
+```text
+As[2][BK][BM + 4]
+Bs[2][BK][BN]
+```
+
+The kernel first loads K tile 0 into buffer 0. For each loop iteration:
+
+1. choose `current_buffer` for compute and `next_buffer = 1 - current_buffer`;
+2. if there is a next K tile, cooperatively load it into `next_buffer`;
+3. compute the 8x8 register tile from `current_buffer`;
+4. `__syncthreads()` so every warp sees a fully loaded next buffer before the next iteration;
+5. flip `current_buffer`.
+
+The important correctness point is that no warp overwrites the buffer being consumed. The previous iteration's barrier proves the next buffer is ready and the old current buffer is no longer being read.
+
+### Why it helps
+
+The intended win is to reduce the hard "load tile, barrier, compute tile, barrier" rhythm. Even though ordinary global loads are still synchronous within each thread, putting next-tile loads before current-tile compute can let the warp scheduler hide some load stalls behind arithmetic from other warps. The price is doubled shared memory.
+
+This is not the same as `cp.async`. Layer 2 still routes global loads through registers and cannot create the explicit async copy pipeline that Layer 3 will try.
+
+### Expected vs measured
+
+Expected from the design doc: +5-8% over Layer 1 if global-load latency is exposed.
+
+Measured results:
+
+| Size | cuda_reg_v2 Layer 2 GFLOPs | % cuBLAS | Verification |
+| ---: | -------------------------: | -------: | :----------: |
+| 1024^3 | 12451.3 | 37.3% | passed |
+| 2048^3 | 34979.4 | 68.6% | passed |
+| 4096^3 | 36056.5 | 77.0% | passed |
+
+Same-run uplift over `cuda_reg`:
+
+| Size | cuda_reg GFLOPs | cuda_reg_v2 L2 GFLOPs | Uplift |
+| ---: | --------------: | --------------------: | -----: |
+| 1024^3 | 12135.4 | 12451.3 | +2.6% |
+| 2048^3 | 32996.6 | 34979.4 | +6.0% |
+| 4096^3 | 33187.9 | 36056.5 | +8.6% |
+
+Layer 2 is essentially flat versus Layer 1 at 4096^3: 36056.5 GFLOPs vs Layer 1's 36094.7 GFLOPs. The honest interpretation is that ordinary-load double buffering did not add meaningful overlap for the largest square GEMM. It did not break correctness, and it keeps the door open for Layer 3 `cp.async`, where the copy can actually be asynchronous and can avoid staging through registers.
+
+### ptxas / NCU
+
+NCU remains blocked by `ERR_NVGPUCTRPERM`.
+
+`ptxas --verbose` output:
+
+```text
+0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+Used 109 registers, 16640 bytes smem, 388 bytes cmem[0]
+```
+
+Shared memory doubled from 8320 bytes to 16640 bytes, exactly as expected. Registers/thread dropped from 113 to 109, and there is still no spill. With 109 registers/thread and 256 threads/block, a 65536-register SM can still fit at most two such blocks by registers: `2 * 256 * 109 = 55808`, while three blocks would exceed the register file.
+
+### Defense checklist
+
+- What is double buffering? Two shared-memory buffers let one K tile be prepared while the other is consumed.
+- Why is there a barrier after compute? It proves all next-buffer loads are visible before any warp reads that buffer next iteration.
+- Why did it not improve much at 4096^3? Ordinary loads are still synchronous in each issuing warp, so this layer only gives scheduler-level latency hiding, not a true async copy pipeline.
+- Why continue to cp.async? `cp.async` is the mechanism that can make global-to-smem copy genuinely asynchronous and avoid extra register staging.
